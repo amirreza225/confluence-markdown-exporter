@@ -275,14 +275,22 @@ class Attachment(Document):
         """Generate Docusaurus-compatible attachment path (static/img/ or static/files/)."""
         # Determine if this is an image or other file
         image_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.drawio.png')
-        is_image = self.extension.lower() in image_extensions
+        extension = self.extension if self.extension else ''
+        is_image = extension.lower() in image_extensions
 
         # Choose subfolder based on file type
         subfolder = "img" if is_image else "files"
 
+        # Build filename - use file_id if available, otherwise use sanitized title
+        if self.file_id:
+            filename = self.filename
+        else:
+            # Fallback to title-based filename when file_id is missing
+            filename = sanitize_filename(self.title) + extension
+
         # Build path: static/img/space-name/filename or static/files/space-name/filename
         space_folder = sanitize_filename(self.space.key.lower())
-        return Path(settings.docusaurus.static_folder) / subfolder / space_folder / self.filename
+        return Path(settings.docusaurus.static_folder) / subfolder / space_folder / filename
 
     @classmethod
     def from_json(cls, data: JsonResponse) -> "Attachment":
