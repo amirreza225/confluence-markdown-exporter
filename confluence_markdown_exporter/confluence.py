@@ -767,7 +767,6 @@ class Page(Document):
             # Escape HTML-like tags (but not markdown syntax or comparison operators)
             # Pattern: < followed by letters/numbers/special chars and ending with >
             # This catches things like <customer>, <li>, </tag>, <tag/>, etc.
-            import re
 
             # Match HTML-like tags but preserve markdown and comparisons
             # Look for patterns like <word>, </word>, <word/>, <word attr="val">
@@ -1323,7 +1322,6 @@ class Page(Document):
                     # Convert to text placeholder instead
                     if settings.docusaurus.enabled:
                         # Extract filename from URL if possible
-                        import re
                         filename_match = re.search(r'/([^/?]+)(?:\?|$)', url_src)
                         filename = filename_match.group(1) if filename_match else "image"
                         return f"[Image: {filename}]"
