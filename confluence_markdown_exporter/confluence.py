@@ -804,11 +804,10 @@ class Page(Document):
             # Or check for a title element
             elif title_el := el.find(class_="title"):
                 title = title_el.get_text(strip=True)
-                # Remove title element from content
-                title_el.decompose()
 
-            # Process the content
-            content = self.process_tag(el, parent_tags).strip()
+            # Use the already-processed text content (passed as parameter)
+            # This avoids recursion issues
+            content = text.strip()
 
             # Build Docusaurus admonition
             result = f"\n:::{admonition_type}"
