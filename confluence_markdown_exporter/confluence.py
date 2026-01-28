@@ -265,8 +265,24 @@ class Attachment(Document):
 
     @property
     def export_path(self) -> Path:
+        if settings.docusaurus.enabled:
+            return self._get_docusaurus_attachment_path()
+
         filepath_template = Template(settings.export.attachment_path.replace("{", "${"))
         return Path(filepath_template.safe_substitute(self._template_vars))
+
+    def _get_docusaurus_attachment_path(self) -> Path:
+        """Generate Docusaurus-compatible attachment path (static/img/ or static/files/)."""
+        # Determine if this is an image or other file
+        image_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.drawio.png')
+        is_image = self.extension.lower() in image_extensions
+
+        # Choose subfolder based on file type
+        subfolder = "img" if is_image else "files"
+
+        # Build path: static/img/space-name/filename or static/files/space-name/filename
+        space_folder = sanitize_filename(self.space.key.lower())
+        return Path(settings.docusaurus.static_folder) / subfolder / space_folder / self.filename
 
     @classmethod
     def from_json(cls, data: JsonResponse) -> "Attachment":
@@ -385,8 +401,41 @@ class Page(Document):
 
     @property
     def export_path(self) -> Path:
+        if settings.docusaurus.enabled:
+            return self._get_docusaurus_page_path()
+
         filepath_template = Template(settings.export.page_path.replace("{", "${"))
         return Path(filepath_template.safe_substitute(self._template_vars))
+
+    def _get_docusaurus_page_path(self) -> Path:
+        """Generate Docusaurus-compatible page path (docs/space-name/...)."""
+        # Start with docs folder
+        path = Path(settings.docusaurus.docs_folder)
+
+        # Add space name as top-level folder
+        space_folder = sanitize_filename(self.space.key.lower())
+        path = path / space_folder
+
+        # Add ancestor hierarchy (folders)
+        for ancestor_id in self.ancestors:
+            ancestor = Page.from_id(ancestor_id)
+            folder_name = sanitize_filename(ancestor.title)
+            path = path / folder_name
+
+        # Add page filename (slugified title)
+        slug = self._generate_docusaurus_slug(self.title)
+        filename = f"{slug}.md"
+
+        return path / filename
+
+    @staticmethod
+    def _generate_docusaurus_slug(title: str) -> str:
+        """Generate URL-safe slug from title for Docusaurus."""
+        slug = title.lower()
+        slug = re.sub(r'[^a-z0-9\s-]', '', slug)
+        slug = re.sub(r'\s+', '-', slug)
+        slug = slug.strip('-')
+        return slug if slug else 'untitled'
 
     @property
     def html(self) -> str:
@@ -583,7 +632,13 @@ class Page(Document):
         @property
         def front_matter(self) -> str:
             indent = self.options["front_matter_indent"]
+
+            # Set basic properties
             self.set_page_properties(tags=self.labels)
+
+            # Add Docusaurus-specific frontmatter if enabled
+            if settings.docusaurus.enabled:
+                self._add_docusaurus_frontmatter()
 
             if not self.page_properties:
                 return ""
@@ -592,6 +647,89 @@ class Page(Document):
             # Indent the root level list items
             yml = re.sub(r"^( *)(- )", r"\1" + " " * indent + r"\2", yml, flags=re.MULTILINE)
             return f"---\n{yml}\n---\n"
+
+        def _add_docusaurus_frontmatter(self) -> None:
+            """Add Docusaurus-specific frontmatter fields."""
+            # Generate ID from title (slugified)
+            doc_id = self._generate_slug(self.page.title)
+            self.set_page_properties(id=doc_id)
+
+            # Extract description from first paragraph
+            description = self._extract_description(self.page.body)
+            if description:
+                self.set_page_properties(description=description)
+
+            # Sidebar label (shortened title or from page properties)
+            sidebar_label = self._get_sidebar_label()
+            if sidebar_label != self.page.title:  # Only add if different from title
+                self.set_page_properties(sidebar_label=sidebar_label)
+
+            # Auto-generate sidebar position if enabled
+            if settings.docusaurus.auto_sidebar_position:
+                # Calculate position based on ancestor depth and order
+                position = len(self.page.ancestors) * settings.docusaurus.sidebar_position_increment
+                self.set_page_properties(sidebar_position=position)
+
+            # Convert Confluence labels to Docusaurus tags
+            if self.page.labels:
+                tags = self._convert_labels_to_tags()
+                self.set_page_properties(tags=tags)
+
+        def _generate_slug(self, title: str) -> str:
+            """Convert title to URL-safe slug for Docusaurus ID."""
+            # Convert to lowercase
+            slug = title.lower()
+            # Remove special characters (keep alphanumeric and spaces)
+            slug = re.sub(r'[^a-z0-9\s-]', '', slug)
+            # Replace spaces with hyphens
+            slug = re.sub(r'\s+', '-', slug)
+            # Remove leading/trailing hyphens
+            slug = slug.strip('-')
+            return slug if slug else 'untitled'
+
+        def _extract_description(self, html_content: str, max_length: int = 160) -> str:
+            """Extract first paragraph from HTML content for description."""
+            soup = BeautifulSoup(html_content, "html.parser")
+
+            # Skip the title if present
+            for h1 in soup.find_all('h1'):
+                h1.decompose()
+
+            # Find first paragraph
+            first_p = soup.find('p')
+            if not first_p:
+                return ""
+
+            # Get text content
+            text = first_p.get_text(strip=True)
+
+            # Truncate if needed
+            if len(text) > max_length:
+                text = text[:max_length].rsplit(' ', 1)[0] + '...'
+
+            return text
+
+        def _get_sidebar_label(self) -> str:
+            """Get sidebar label - use title, potentially shortened."""
+            # Could check for custom property in the future
+            # For now, use the title limited to 50 characters
+            title = self.page.title
+            if len(title) > 50:
+                return title[:47] + '...'
+            return title
+
+        def _convert_labels_to_tags(self) -> list[str]:
+            """Convert Confluence labels to Docusaurus tags."""
+            # Remove # prefix and format as tags
+            tags = []
+            for label in self.page.labels:
+                # Clean label name
+                tag = label.name.lower().replace(' ', '-')
+                # Remove special characters
+                tag = re.sub(r'[^a-z0-9-]', '', tag)
+                if tag:
+                    tags.append(tag)
+            return tags
 
         @property
         def breadcrumbs(self) -> str:
@@ -629,7 +767,61 @@ class Page(Document):
             self.set_page_properties(**props)
 
         def convert_alert(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
-            """Convert Confluence info macros to Markdown GitHub style alerts.
+            """Convert Confluence info macros to Markdown alerts.
+
+            Converts to either Docusaurus admonitions (:::note) or GitHub style alerts (> [!NOTE])
+            depending on the Docusaurus mode setting.
+            """
+            macro_name = str(el["data-macro-name"])
+
+            if settings.docusaurus.enabled:
+                return self._convert_to_docusaurus_admonition(el, text, macro_name, parent_tags)
+            else:
+                return self._convert_to_github_alert(el, text, macro_name, parent_tags)
+
+        def _convert_to_docusaurus_admonition(
+            self, el: BeautifulSoup, text: str, macro_name: str, parent_tags: list[str]
+        ) -> str:
+            """Convert to Docusaurus admonition syntax (:::note, :::tip, etc.)."""
+            # Map Confluence macro names to Docusaurus admonition types
+            admonition_type_map = {
+                "info": "info",
+                "panel": "note",
+                "tip": "tip",
+                "note": "note",
+                "warning": "warning",
+            }
+
+            admonition_type = admonition_type_map.get(
+                macro_name, settings.docusaurus.default_admonition_type
+            )
+
+            # Extract title if present (from the first child element or data attribute)
+            title = None
+            # Check for title in data attributes
+            if el.has_attr("data-title"):
+                title = str(el["data-title"])
+            # Or check for a title element
+            elif title_el := el.find(class_="title"):
+                title = title_el.get_text(strip=True)
+                # Remove title element from content
+                title_el.decompose()
+
+            # Process the content
+            content = self.process_tag(el, parent_tags).strip()
+
+            # Build Docusaurus admonition
+            result = f"\n:::{admonition_type}"
+            if title:
+                result += f" {title}"
+            result += f"\n\n{content}\n\n:::\n\n"
+
+            return result
+
+        def _convert_to_github_alert(
+            self, el: BeautifulSoup, text: str, macro_name: str, parent_tags: list[str]
+        ) -> str:
+            """Convert to GitHub-style alert syntax (> [!NOTE]).
 
             GitHub specific alert types: https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax#alerts
             """
@@ -641,7 +833,7 @@ class Page(Document):
                 "warning": "CAUTION",
             }
 
-            alert_type = alert_type_map.get(str(el["data-macro-name"]), "NOTE")
+            alert_type = alert_type_map.get(macro_name, "NOTE")
 
             blockquote = super().convert_blockquote(el, text, parent_tags)
             return f"\n> [!{alert_type}]{blockquote}"
@@ -1081,6 +1273,22 @@ class Page(Document):
 
         def _get_path_for_href(self, path: Path, style: Literal["absolute", "relative"]) -> str:
             """Get the path to use in href attributes based on settings."""
+            # In Docusaurus mode, use absolute paths for static assets
+            if settings.docusaurus.enabled:
+                path_str = str(path)
+                # Check if this is a static asset (img or files)
+                if path_str.startswith(settings.docusaurus.static_folder):
+                    # Extract the part after static/
+                    # e.g., static/img/space/file.png -> /img/space/file.png
+                    relative_to_static = path_str.split(f"{settings.docusaurus.static_folder}/", 1)
+                    if len(relative_to_static) > 1:
+                        return "/" + relative_to_static[1]
+
+                # For page links, use relative paths
+                result = os.path.relpath(path, self.page.export_path.parent)
+                return result
+
+            # Legacy mode
             if style == "absolute":
                 # Note that usually absolute would be
                 # something like this: (settings.export.output_path / path).absolute()
@@ -1090,6 +1298,100 @@ class Page(Document):
             else:
                 result = os.path.relpath(path, self.page.export_path.parent)
             return result
+
+
+class CategoryFileGenerator:
+    """Generate _category_.json files for Docusaurus sidebar organization."""
+
+    def __init__(self) -> None:
+        self.category_data: dict[str, dict] = {}
+
+    def collect_category_info(self, page: "Page", position_index: int = 0) -> None:
+        """Collect information about folders/categories during page processing."""
+        if not settings.docusaurus.enabled or not settings.docusaurus.generate_category_files:
+            return
+
+        # Get the parent folder path
+        parent_folder = page.export_path.parent
+
+        # Skip if this is the root docs folder or space folder
+        if str(parent_folder) in [settings.docusaurus.docs_folder,
+                                   str(Path(settings.docusaurus.docs_folder) / sanitize_filename(page.space.key.lower()))]:
+            return
+
+        # Convert to absolute path for consistency
+        folder_key = str(parent_folder)
+
+        if folder_key not in self.category_data:
+            # Get category label from parent page title
+            category_label = parent_folder.name
+
+            # Try to get a better label from the parent page
+            if page.ancestors:
+                parent_page_id = page.ancestors[-1]
+                try:
+                    parent_page = Page.from_id(parent_page_id)
+                    category_label = parent_page.title
+                except Exception:
+                    pass
+
+            # Calculate position based on hierarchy depth
+            depth = len(page.ancestors)
+            position = depth * settings.docusaurus.sidebar_position_increment
+
+            self.category_data[folder_key] = {
+                'label': category_label,
+                'position': position,
+                'pages': [],
+            }
+
+        # Add page to category
+        self.category_data[folder_key]['pages'].append({
+            'title': page.title,
+            'position': position_index
+        })
+
+    def generate_category_files(self) -> None:
+        """Generate all _category_.json files after processing all pages."""
+        if not settings.docusaurus.enabled or not settings.docusaurus.generate_category_files:
+            return
+
+        for folder_path, category_info in self.category_data.items():
+            category_file_path = Path(folder_path) / "_category_.json"
+
+            # Prepare category content
+            page_count = len(category_info['pages'])
+            category_content = {
+                "label": category_info['label'],
+                "position": category_info['position'],
+                "link": {
+                    "type": "generated-index",
+                    "description": f"This section contains {page_count} page(s)."
+                },
+                "collapsed": False,
+                "collapsible": True
+            }
+
+            # Write category file
+            full_path = settings.export.output_path / category_file_path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(full_path, 'w', encoding='utf-8') as f:
+                json.dump(category_content, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"Generated category file: {category_file_path}")
+
+
+# Global category generator instance
+_category_generator: CategoryFileGenerator | None = None
+
+
+def get_category_generator() -> CategoryFileGenerator:
+    """Get or create the global category generator instance."""
+    global _category_generator  # noqa: PLW0603
+    if _category_generator is None:
+        _category_generator = CategoryFileGenerator()
+    return _category_generator
 
 
 def export_page(page_id: int) -> None:
@@ -1102,6 +1404,10 @@ def export_page(page_id: int) -> None:
     page = Page.from_id(page_id)
     page.export()
 
+    # Collect category info for Docusaurus
+    if settings.docusaurus.enabled:
+        get_category_generator().collect_category_info(page)
+
 
 def export_pages(page_ids: list[int]) -> None:
     """Export a list of Confluence pages to Markdown.
@@ -1110,6 +1416,14 @@ def export_pages(page_ids: list[int]) -> None:
         page_ids: List of pages to export.
         output_path: The output path.
     """
+    # Reset category generator for fresh export
+    global _category_generator  # noqa: PLW0603
+    _category_generator = CategoryFileGenerator()
+
     for page_id in (pbar := tqdm(page_ids, smoothing=0.05)):
         pbar.set_postfix_str(f"Exporting page {page_id}")
         export_page(page_id)
+
+    # Generate category files at the end
+    if settings.docusaurus.enabled:
+        get_category_generator().generate_category_files()

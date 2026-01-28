@@ -241,6 +241,56 @@ class ExportConfig(BaseModel):
     )
 
 
+class DocusaurusConfig(BaseModel):
+    """Docusaurus-specific export configuration."""
+
+    enabled: bool = Field(
+        default=False,
+        title="Enable Docusaurus Mode",
+        description="Enable Docusaurus-compatible export format.",
+    )
+    docs_folder: str = Field(
+        default="docs",
+        title="Docs Folder",
+        description="Output folder name for documentation files (relative to output_path).",
+    )
+    static_folder: str = Field(
+        default="static",
+        title="Static Folder",
+        description="Output folder name for static assets (relative to output_path).",
+    )
+    image_path: str = Field(
+        default="/img",
+        title="Image Path Prefix",
+        description="Absolute path prefix for images in markdown (e.g., /img).",
+    )
+    attachments_path: str = Field(
+        default="/files",
+        title="Attachments Path Prefix",
+        description="Absolute path prefix for non-image attachments in markdown (e.g., /files).",
+    )
+    generate_category_files: bool = Field(
+        default=True,
+        title="Generate Category Files",
+        description="Generate _category_.json files for Docusaurus sidebar organization.",
+    )
+    auto_sidebar_position: bool = Field(
+        default=True,
+        title="Auto Sidebar Position",
+        description="Automatically generate sidebar_position in frontmatter based on page hierarchy.",
+    )
+    sidebar_position_increment: int = Field(
+        default=10,
+        title="Sidebar Position Increment",
+        description="Increment value for sidebar positions (e.g., 10, 20, 30...).",
+    )
+    default_admonition_type: str = Field(
+        default="note",
+        title="Default Admonition Type",
+        description="Default Docusaurus admonition type for unrecognized Confluence panels.",
+    )
+
+
 class ConfigModel(BaseModel):
     """Top-level application configuration model."""
 
@@ -249,6 +299,9 @@ class ConfigModel(BaseModel):
         default_factory=ConnectionConfig, title="Connection Configuration"
     )
     auth: AuthConfig = Field(default_factory=AuthConfig, title="Authentication")
+    docusaurus: DocusaurusConfig = Field(
+        default_factory=DocusaurusConfig, title="Docusaurus Configuration"
+    )
 
 
 def load_app_data() -> dict[str, dict]:
@@ -274,6 +327,7 @@ def get_settings() -> ConfigModel:
         export=ExportConfig(**data.get("export", {})),
         connection_config=ConnectionConfig(**data.get("connection_config", {})),
         auth=AuthConfig(**data.get("auth", {})),
+        docusaurus=DocusaurusConfig(**data.get("docusaurus", {})),
     )
 
 

@@ -2,7 +2,7 @@
   <a href="https://github.com/Spenhouet/confluence-markdown-exporter"><img src="https://raw.githubusercontent.com/Spenhouet/confluence-markdown-exporter/b8caaba935eea7e7017b887c86a740cb7bf99708/logo.png" alt="confluence-markdown-exporter"></a>
 </p>
 <p align="center">
-    <em>The confluence-markdown-exporter exports Confluence pages in Markdown format. This exporter helps in migrating content from Confluence to platforms that support Markdown e.g. Obsidian, Gollum, Azure DevOps (ADO), Foam, Dendron and more.</em>
+    <em>The confluence-markdown-exporter exports Confluence pages in Markdown format. This exporter helps in migrating content from Confluence to platforms that support Markdown e.g. Docusaurus, Obsidian, Gollum, Azure DevOps (ADO), Foam, Dendron and more.</em>
 </p>
 <p align="center">
   <a href="https://github.com/Spenhouet/confluence-markdown-exporter/actions/workflows/ci.yml"><img src="https://github.com/Spenhouet/confluence-markdown-exporter/actions/workflows/ci.yml/badge.svg" alt="Test, Lint and Build"></a>
@@ -163,12 +163,107 @@ This will open a menu where you can:
 | auth.jira.username                    | Jira username/email                                                                                                   | ""                                                                  |
 | auth.jira.api_token                   | Jira API token                                                                                                        | ""                                                                  |
 | auth.jira.pat                         | Jira Personal Access Token                                                                                            | ""                                                                  |
+| docusaurus.enabled                    | Enable Docusaurus-compatible export format                                                                            | False                                                               |
+| docusaurus.docs_folder                | Output folder name for documentation files                                                                            | docs                                                                |
+| docusaurus.static_folder              | Output folder name for static assets                                                                                  | static                                                              |
+| docusaurus.image_path                 | Absolute path prefix for images in markdown                                                                           | /img                                                                |
+| docusaurus.attachments_path           | Absolute path prefix for non-image attachments                                                                        | /files                                                              |
+| docusaurus.generate_category_files    | Generate \_category_.json files for sidebar organization                                                              | True                                                                |
+| docusaurus.auto_sidebar_position      | Auto-generate sidebar_position in frontmatter                                                                         | True                                                                |
+| docusaurus.sidebar_position_increment | Increment value for sidebar positions                                                                                 | 10                                                                  |
+| docusaurus.default_admonition_type    | Default admonition type for unrecognized Confluence panels                                                            | note                                                                |
 
 You can always view and change the current config with the interactive menu above.
 
 ### Configuration for Target Systems
 
 Some platforms have specific requirements for Markdown formatting, file structure, or metadata. You can adjust the export configuration to optimize output for your target system. Below are some common examples:
+
+#### Docusaurus
+
+The exporter includes full support for [Docusaurus](https://docusaurus.io/), a modern static site generator. When Docusaurus mode is enabled, the exporter will:
+
+- Generate Docusaurus-compatible frontmatter (id, title, description, sidebar_label, sidebar_position, tags)
+- Organize files into `docs/` and `static/` folders
+- Convert Confluence admonitions to Docusaurus syntax (`:::note`, `:::tip`, `:::info`, `:::warning`)
+- Generate `_category_.json` files for sidebar organization
+- Use absolute paths for static assets (`/img/...`, `/files/...`)
+
+**Configuration**:
+
+To enable Docusaurus mode, set the following configuration:
+
+```json
+{
+  "docusaurus": {
+    "enabled": true,
+    "docs_folder": "docs",
+    "static_folder": "static",
+    "image_path": "/img",
+    "attachments_path": "/files",
+    "generate_category_files": true,
+    "auto_sidebar_position": true,
+    "sidebar_position_increment": 10,
+    "default_admonition_type": "note"
+  }
+}
+```
+
+**Output Structure**:
+
+```
+output/
+├── docs/
+│   └── my-space/
+│       ├── _category_.json
+│       ├── overview.md
+│       └── guides/
+│           ├── _category_.json
+│           ├── getting-started.md
+│           └── advanced-topics.md
+└── static/
+    ├── img/
+    │   └── my-space/
+    │       ├── diagram1.png
+    │       └── screenshot.jpg
+    └── files/
+        └── my-space/
+            └── attachment.pdf
+```
+
+**Frontmatter Example**:
+
+```yaml
+---
+id: getting-started
+title: Getting Started Guide
+description: Learn how to get started with our platform
+sidebar_label: Getting Started
+sidebar_position: 10
+tags: [tutorial, beginner, guide]
+---
+```
+
+**Using with Docusaurus**:
+
+After exporting, integrate with your Docusaurus site:
+
+1. Export your Confluence content:
+   ```sh
+   confluence-markdown-exporter spaces MYSPACE ./output
+   ```
+
+2. Copy the exported content to your Docusaurus project:
+   ```sh
+   cp -r output/docs/* docusaurus-site/docs/
+   cp -r output/static/* docusaurus-site/static/
+   ```
+
+3. Build your Docusaurus site:
+   ```sh
+   cd docusaurus-site
+   npm run build
+   ```
 
 #### Obsidian
 
