@@ -647,7 +647,7 @@ class Page(Document):
 
             MDX interprets curly braces {} as JSX expressions and < > as JSX tags.
             This method escapes these characters when they appear in regular text
-            (not in code blocks or inline code).
+            (not in code blocks, inline code, or valid markdown syntax).
             """
             lines = content.split('\n')
             result_lines = []
@@ -668,7 +668,7 @@ class Page(Document):
                     result_lines.append(line)
                     continue
 
-                # Escape curly braces outside of inline code
+                # Escape curly braces and HTML tags outside of inline code and markdown syntax
                 # Split by inline code markers to preserve inline code
                 parts = []
                 current_pos = 0
@@ -683,8 +683,8 @@ class Page(Document):
                         # No more backticks, process remaining text
                         if not in_inline_code:
                             text_part = line[current_pos:]
-                            # Escape curly braces
-                            text_part = text_part.replace('{', '\\{').replace('}', '\\}')
+                            # Escape curly braces and HTML-like tags
+                            text_part = self._escape_mdx_text(text_part)
                             parts.append(text_part)
                         else:
                             parts.append(line[current_pos:])
@@ -693,8 +693,8 @@ class Page(Document):
                     # Process text before the backtick
                     if not in_inline_code:
                         text_part = line[current_pos:next_backtick]
-                        # Escape curly braces in regular text
-                        text_part = text_part.replace('{', '\\{').replace('}', '\\}')
+                        # Escape curly braces and HTML-like tags in regular text
+                        text_part = self._escape_mdx_text(text_part)
                         parts.append(text_part)
                     else:
                         # Inside inline code, don't escape
@@ -708,6 +708,43 @@ class Page(Document):
                 result_lines.append(''.join(parts))
 
             return '\n'.join(result_lines)
+
+        def _escape_mdx_text(self, text: str) -> str:
+            """Escape MDX special characters in text while preserving valid markdown.
+
+            This escapes:
+            - Curly braces {} (interpreted as JSX expressions)
+            - HTML-like tags <tag> (interpreted as JSX components)
+
+            But preserves:
+            - Markdown image syntax ![alt](url)
+            - Markdown link syntax [text](url)
+            - Comparison operators in regular text (< and >)
+            """
+            # Escape curly braces
+            text = text.replace('{', '\\{').replace('}', '\\}')
+
+            # Escape HTML-like tags (but not markdown syntax or comparison operators)
+            # Pattern: < followed by letters/numbers/special chars and ending with >
+            # This catches things like <customer>, <li>, </tag>, <tag/>, etc.
+            import re
+
+            # Match HTML-like tags but preserve markdown and comparisons
+            # Look for patterns like <word>, </word>, <word/>, <word attr="val">
+            def replace_html_tags(match):
+                tag = match.group(0)
+                # Don't escape if it looks like a comparison (e.g., "< 10" or "x > 5")
+                # This is a simple heuristic - if there's whitespace after < or before >, it's likely a comparison
+                if tag.startswith('< ') or tag.endswith(' >'):
+                    return tag
+                # Escape the angle brackets
+                return tag.replace('<', '\\<').replace('>', '\\>')
+
+            # Match HTML tags: <tag>, </tag>, <tag/>, <tag attr="value">, etc.
+            # But not things like "< 5" or "x > 10"
+            text = re.sub(r'</?[a-zA-Z][a-zA-Z0-9]*[^>]*/?>', replace_html_tags, text)
+
+            return text
 
         @property
         def front_matter(self) -> str:
@@ -1241,10 +1278,20 @@ class Page(Document):
                         f"on page '{self.page.title}' (ID: {self.page.id}). "
                         f"Image may not be accessible in the exported markdown."
                     )
+
+                    # In Docusaurus mode, don't output broken Confluence URLs
+                    # Convert to text placeholder instead
+                    if settings.docusaurus.enabled:
+                        # Extract filename from URL if possible
+                        import re
+                        filename_match = re.search(r'/([^/?]+)(?:\?|$)', url_src)
+                        filename = filename_match.group(1) if filename_match else "image"
+                        return f"[Image: {filename}]"
+
                 href = el.get("href") or text
-                if href:
+                if href and not href.startswith("/download/"):
                     return f"![{text}]({href})"
-                if url_src:
+                if url_src and not url_src.startswith("/download/"):
                     return f"![{text}]({url_src})"
                 return text
 
