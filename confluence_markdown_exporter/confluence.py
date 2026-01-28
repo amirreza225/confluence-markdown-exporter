@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import re
+import sys
 import urllib.parse
 from collections.abc import Set
 from os import PathLike
@@ -48,6 +49,11 @@ StrPath: TypeAlias = str | PathLike[str]
 DEBUG: bool = str_to_bool(os.getenv("DEBUG", "False"))
 
 logger = logging.getLogger(__name__)
+
+# Increase recursion limit to handle deeply nested Confluence page structures
+# Default is 1000, we increase to 5000 to handle complex pages
+# Pages that still exceed this will be caught and skipped with a RecursionError handler
+sys.setrecursionlimit(5000)
 
 settings = get_settings()
 confluence = get_confluence_instance()
@@ -460,11 +466,45 @@ class Page(Document):
             logger.warning(f"Skipping export for inaccessible page with ID {self.id}")
             return
 
+        logger.info(f"Exporting page: '{self.title}' (ID: {self.id})")
+
         if DEBUG:
             self.export_body()
         # Export attachments first so the files can be utilized during markdown conversion
         self.export_attachments()
-        self.export_markdown()
+
+        try:
+            self.export_markdown()
+            logger.info(f"Successfully exported: '{self.title}' (ID: {self.id})")
+        except RecursionError:
+            logger.error(
+                f"RecursionError while exporting page '{self.title}' (ID: {self.id}). "
+                f"This page has deeply nested HTML structures that exceed Python's recursion limit. "
+                f"Skipping this page and continuing with export."
+            )
+            # Create a placeholder file to indicate the page was skipped
+            placeholder_content = (
+                f"---\n"
+                f"title: {self.title}\n"
+                f"id: {self.id}\n"
+                f"---\n\n"
+                f"# {self.title}\n\n"
+                f"> **Export Error**: This page could not be exported due to deeply nested HTML structures "
+                f"that caused a recursion error during conversion.\n\n"
+                f"Please export this page manually from Confluence or simplify its structure.\n\n"
+                f"Page ID: {self.id}\n"
+            )
+            save_file(
+                settings.export.output_path / self.export_path,
+                placeholder_content,
+            )
+        except Exception as e:
+            logger.error(
+                f"Unexpected error while exporting page '{self.title}' (ID: {self.id}): {e}",
+                exc_info=True
+            )
+            # Re-raise unexpected errors
+            raise
 
     def export_with_descendants(self) -> None:
         export_pages([self.id, *self.descendants])
