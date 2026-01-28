@@ -631,11 +631,83 @@ class Page(Document):
         @property
         def markdown(self) -> str:
             md_body = self.convert(self.page.html)
+
+            # Apply MDX escaping if Docusaurus mode is enabled
+            if settings.docusaurus.enabled:
+                md_body = self._escape_mdx_special_chars(md_body)
+
             markdown = f"{self.front_matter}\n"
             if settings.export.page_breadcrumbs:
                 markdown += f"{self.breadcrumbs}\n"
             markdown += f"{md_body}\n"
             return markdown
+
+        def _escape_mdx_special_chars(self, content: str) -> str:
+            """Escape special characters for MDX compatibility.
+
+            MDX interprets curly braces {} as JSX expressions and < > as JSX tags.
+            This method escapes these characters when they appear in regular text
+            (not in code blocks or inline code).
+            """
+            lines = content.split('\n')
+            result_lines = []
+            in_code_block = False
+            code_block_marker = ''
+
+            for line in lines:
+                # Track code blocks to avoid escaping content inside them
+                if line.strip().startswith('```'):
+                    in_code_block = not in_code_block
+                    if in_code_block:
+                        code_block_marker = line.strip()
+                    result_lines.append(line)
+                    continue
+
+                if in_code_block:
+                    # Don't escape anything in code blocks
+                    result_lines.append(line)
+                    continue
+
+                # Escape curly braces outside of inline code
+                # Split by inline code markers to preserve inline code
+                parts = []
+                current_pos = 0
+                in_inline_code = False
+                backtick_pos = 0
+
+                while current_pos < len(line):
+                    # Find next backtick
+                    next_backtick = line.find('`', current_pos)
+
+                    if next_backtick == -1:
+                        # No more backticks, process remaining text
+                        if not in_inline_code:
+                            text_part = line[current_pos:]
+                            # Escape curly braces
+                            text_part = text_part.replace('{', '\\{').replace('}', '\\}')
+                            parts.append(text_part)
+                        else:
+                            parts.append(line[current_pos:])
+                        break
+
+                    # Process text before the backtick
+                    if not in_inline_code:
+                        text_part = line[current_pos:next_backtick]
+                        # Escape curly braces in regular text
+                        text_part = text_part.replace('{', '\\{').replace('}', '\\}')
+                        parts.append(text_part)
+                    else:
+                        # Inside inline code, don't escape
+                        parts.append(line[current_pos:next_backtick])
+
+                    # Add the backtick
+                    parts.append('`')
+                    in_inline_code = not in_inline_code
+                    current_pos = next_backtick + 1
+
+                result_lines.append(''.join(parts))
+
+            return '\n'.join(result_lines)
 
         @property
         def front_matter(self) -> str:
@@ -1041,7 +1113,12 @@ class Page(Document):
                 link = self.convert_attachment_link(el, text, parent_tags)
                 # convert_attachment_link may return None if the attachment meta is incomplete
                 return link or f"[{text}]({el.get('href')})"
+            # Handle /wiki/.../pages/123 pattern
             if match := re.search(r"/wiki/.+?/pages/(\d+)", str(el.get("href", ""))):
+                page_id = match.group(1)
+                return self.convert_page_link(int(page_id))
+            # Handle /pages/viewpage.action?pageId=123 pattern
+            if match := re.search(r"[/]pages/viewpage\.action\?pageId=(\d+)", str(el.get("href", ""))):
                 page_id = match.group(1)
                 return self.convert_page_link(int(page_id))
             if str(el.get("href", "")).startswith("#"):
@@ -1141,7 +1218,29 @@ class Page(Document):
                     if len(drawio_images) > 0:
                         attachment = drawio_images[0]
 
+            # Try to extract attachment from Confluence URLs if attachment is still None
+            if attachment is None and url_src:
+                # Try to extract attachment ID from /download/attachments/<id>/filename or /download/thumbnails/<id>/filename
+                if match := re.search(r"/download/(?:attachments|thumbnails)/(\d+)/([^?]+)", url_src):
+                    attachment_id = match.group(1)
+                    filename = unquote(match.group(2))
+                    # Try to find attachment by ID
+                    attachment = self.page.get_attachment_by_id(attachment_id)
+                    # If not found by ID, try by filename
+                    if attachment is None:
+                        filename_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+                        matching_attachments = self.page.get_attachments_by_title(filename_without_ext)
+                        if matching_attachments:
+                            attachment = matching_attachments[0]
+
             if attachment is None:
+                # Log warning about missing attachment
+                if url_src and ("/download/" in url_src):
+                    logger.warning(
+                        f"Could not find attachment for image URL '{url_src}' "
+                        f"on page '{self.page.title}' (ID: {self.page.id}). "
+                        f"Image may not be accessible in the exported markdown."
+                    )
                 href = el.get("href") or text
                 if href:
                     return f"![{text}]({href})"
