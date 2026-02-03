@@ -674,7 +674,57 @@ class Page(Document):
 
             # Apply MDX escaping if Docusaurus mode is enabled
             if settings.docusaurus.enabled:
-                md_body = self._escape_mdx_special_chars(md_body)
+                if DEBUG:
+                    print(f"\n{'='*80}")
+                    print(f"MDX ESCAPING for page: {self.page.title}")
+                    print(f"Docusaurus enabled: {settings.docusaurus.enabled}")
+                    print(f"{'='*80}\n")
+                # Simple approach: Replace ALL angle brackets and curly braces outside of code blocks
+                lines = []
+                in_code_block = False
+                line_num = 0
+                for line in md_body.split('\n'):
+                    line_num += 1
+                    # Track code blocks
+                    if line.strip().startswith('```'):
+                        in_code_block = not in_code_block
+                        if DEBUG:
+                            print(f"Line {line_num}: CODE BLOCK {'OPENED' if in_code_block else 'CLOSED'}")
+                        lines.append(line)
+                        continue
+
+                    if in_code_block:
+                        if DEBUG and ('<' in line or '>' in line):
+                            print(f"Line {line_num}: SKIPPING (inside code block): {line[:100]}")
+                        lines.append(line)
+                        continue
+
+                    # Outside code blocks: escape ALL angle brackets and curly braces
+                    # This is aggressive but guaranteed to work - escapes even in inline code
+                    # which is safe since HTML entities render correctly in MDX inline code
+                    has_angle = '<' in line or '>' in line
+                    escaped_line = (line
+                        .replace('<', '&lt;')
+                        .replace('>', '&gt;')
+                        .replace('{', '&#123;')
+                        .replace('}', '&#125;'))
+                    if DEBUG and has_angle:
+                        print(f"Line {line_num}: ESCAPING (outside code block)")
+                        print(f"  BEFORE: {line[:100]}")
+                        print(f"  AFTER:  {escaped_line[:100]}")
+                    lines.append(escaped_line)
+                md_body = '\n'.join(lines)
+
+                if DEBUG:
+                    # Count remaining unescaped brackets
+                    unescaped_lt = md_body.count('<') - md_body.count('&lt;')
+                    unescaped_gt = md_body.count('>') - md_body.count('&gt;')
+                    print(f"\n{'-'*80}")
+                    print(f"ESCAPING COMPLETE for {self.page.title}")
+                    print(f"Total lines processed: {line_num}")
+                    print(f"Remaining '<' after escaping: {unescaped_lt}")
+                    print(f"Remaining '>' after escaping: {unescaped_gt}")
+                    print(f"{'-'*80}\n")
 
             markdown = f"{self.front_matter}\n"
             if settings.export.page_breadcrumbs:
@@ -761,27 +811,33 @@ class Page(Document):
             - Markdown link syntax [text](url)
             - Comparison operators in regular text (< and >)
             """
-            # Escape curly braces
-            text = text.replace('{', '\\{').replace('}', '\\}')
+            # Escape curly braces with HTML entities (not backslashes)
+            text = text.replace('{', '&#123;').replace('}', '&#125;')
 
-            # Escape HTML-like tags (but not markdown syntax or comparison operators)
-            # Pattern: < followed by letters/numbers/special chars and ending with >
-            # This catches things like <customer>, <li>, </tag>, <tag/>, etc.
+            # Escape angle brackets that could be interpreted as JSX tags
+            # This includes patterns like <word>, <redis_url>, <redis\_url> (with escaped underscores)
+            # We need to be more aggressive because markdownify adds backslashes that break our previous regex
 
-            # Match HTML-like tags but preserve markdown and comparisons
-            # Look for patterns like <word>, </word>, <word/>, <word attr="val">
-            def replace_html_tags(match):
-                tag = match.group(0)
+            # Strategy: Find all < followed by non-whitespace and ending with >
+            # But exclude markdown image syntax and comparison operators
+
+            def replace_angle_brackets(match):
+                content = match.group(0)
                 # Don't escape if it looks like a comparison (e.g., "< 10" or "x > 5")
-                # This is a simple heuristic - if there's whitespace after < or before >, it's likely a comparison
-                if tag.startswith('< ') or tag.endswith(' >'):
-                    return tag
-                # Escape the angle brackets
-                return tag.replace('<', '\\<').replace('>', '\\>')
+                if content.startswith('< ') or content.endswith(' >'):
+                    return content
+                # Escape the angle brackets with HTML entities
+                return content.replace('<', '&lt;').replace('>', '&gt;')
 
-            # Match HTML tags: <tag>, </tag>, <tag/>, <tag attr="value">, etc.
-            # But not things like "< 5" or "x > 10"
-            text = re.sub(r'</?[a-zA-Z][a-zA-Z0-9]*[^>]*/?>', replace_html_tags, text)
+            # Match anything that looks like it could be interpreted as a JSX tag:
+            # - <word> - simple tag
+            # - <word_with_underscore> - placeholder
+            # - <word\_escaped> - placeholder with escaped underscore from markdownify
+            # - </word> - closing tag
+            # - <word/> - self-closing tag
+            # Pattern: < followed by non-whitespace content and ending with >
+            # Exclude < followed by space (comparison operators)
+            text = re.sub(r'<(?! )[^>]+>', replace_angle_brackets, text)
 
             return text
 
