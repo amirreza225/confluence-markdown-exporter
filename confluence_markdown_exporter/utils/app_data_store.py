@@ -256,6 +256,15 @@ class ExportConfig(BaseModel):
             "If enabled, the title will be added as a top-level heading."
         ),
     )
+    wiki_js_mode: bool = Field(
+        default=False,
+        title="Wiki.js Mode",
+        description=(
+            "Enable wiki.js compatibility mode. When enabled, pages with children "
+            "are renamed to 'home.md' and placed inside the folder created by their descendants. "
+            "For example, 'Parent.md' with children becomes 'Parent/home.md'."
+        ),
+    )
 
 
 class DocusaurusConfig(BaseModel):

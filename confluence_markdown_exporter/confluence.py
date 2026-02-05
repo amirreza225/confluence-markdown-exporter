@@ -450,7 +450,14 @@ class Page(Document):
             return self._get_docusaurus_page_path()
 
         filepath_template = Template(settings.export.page_path.replace("{", "${"))
-        return Path(filepath_template.safe_substitute(self._template_vars))
+        path = Path(filepath_template.safe_substitute(self._template_vars))
+
+        # Wiki.js mode: pages with children or attachments become folder/home.md
+        if settings.export.wiki_js_mode and (self.descendants or self.attachments):
+            # Transform "path/to/page.md" → "path/to/page/home.md"
+            path = path.parent / path.stem / "home.md"
+
+        return path
 
     def _get_docusaurus_page_path(self) -> Path:
         """Generate Docusaurus-compatible page path (docs/space-name/...)."""
@@ -470,8 +477,14 @@ class Page(Document):
         # Add page filename (slugified title)
         slug = self._generate_docusaurus_slug(self.title)
         filename = f"{slug}.md"
+        final_path = path / filename
 
-        return path / filename
+        # Wiki.js mode: pages with children or attachments become folder/home.md
+        if settings.export.wiki_js_mode and (self.descendants or self.attachments):
+            # Transform "docs/space/page.md" → "docs/space/page/home.md"
+            final_path = final_path.parent / final_path.stem / "home.md"
+
+        return final_path
 
     @staticmethod
     def _generate_docusaurus_slug(title: str) -> str:
