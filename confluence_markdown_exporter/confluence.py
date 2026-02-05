@@ -1878,9 +1878,9 @@ class Page(Document):
 
             for child in cell.children:
                 if isinstance(child, NavigableString):
-                    # Text content - escape HTML entities
-                    text = str(child).strip()
-                    if text:
+                    # Text content - escape HTML entities, preserve whitespace
+                    text = str(child)
+                    if text.strip():  # Only add if there's non-whitespace content
                         result_parts.append(html_module.escape(text))
 
                 elif isinstance(child, Tag):
