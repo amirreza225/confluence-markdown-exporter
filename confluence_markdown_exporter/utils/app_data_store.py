@@ -180,7 +180,7 @@ class ExportConfig(BaseModel):
         ),
     )
     attachment_path: str = Field(
-        default="{space_name}/attachments/{attachment_file_id}{attachment_extension}",
+        default="{space_name}/{homepage_title}/{ancestor_titles}/{page_title}/{attachment_filename}",
         title="Attachment Path Template",
         description=(
             "Template for exported attachment file paths.\n"
@@ -191,13 +191,30 @@ class ExportConfig(BaseModel):
             "  - {homepage_title}: The title of the homepage of the Confluence space.\n"
             "  - {ancestor_ids}: A slash-separated list of ancestor page IDs.\n"
             "  - {ancestor_titles}: A slash-separated list of ancestor page titles.\n"
+            "  - {page_id}: The ID of the page this attachment belongs to.\n"
+            "  - {page_title}: The title of the page this attachment belongs to.\n"
             "  - {attachment_id}: The unique ID of the attachment.\n"
             "  - {attachment_title}: The title of the attachment.\n"
             "  - {attachment_file_id}: The file ID of the attachment.\n"
+            "  - {attachment_filename}: The complete filename (respects attachment_naming setting).\n"
             "  - {attachment_extension}: The file extension of the attachment,\n"
             "including the leading dot."
         ),
-        examples=["{space_name}/attachments/{attachment_file_id}{attachment_extension}"],
+        examples=[
+            "{space_name}/{homepage_title}/{ancestor_titles}/{page_title}/{attachment_filename}",
+            "{ancestor_titles}/{page_title}/{attachment_filename}",
+            "{space_name}/attachments/{attachment_filename}",
+        ],
+    )
+    attachment_naming: Literal["title", "file_id", "id"] = Field(
+        default="title",
+        title="Attachment Naming Strategy",
+        description=(
+            "How to generate attachment filenames. Options: title, file_id, id.\n"
+            "  - `title`: Use the attachment title (safe, descriptive, prevents hidden files)\n"
+            "  - `file_id`: Use the file_id GUID (may create hidden files if file_id is empty)\n"
+            "  - `id`: Use the attachment ID (always unique and safe)"
+        ),
     )
     attachment_export_all: bool = Field(
         default=False,

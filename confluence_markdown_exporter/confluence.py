@@ -256,17 +256,52 @@ class Attachment(Document):
 
     @property
     def filename(self) -> str:
-        return f"{self.file_id}{self.extension}"
+        naming_strategy = settings.export.attachment_naming
+
+        if naming_strategy == "title":
+            # Use sanitized attachment title to prevent hidden files
+            return f"{sanitize_filename(self.title)}{self.extension}"
+        elif naming_strategy == "id":
+            # Use attachment ID (always safe and unique)
+            return f"{self.id}{self.extension}"
+        else:  # "file_id"
+            # Use file_id (may create hidden files if empty, but preserves original behavior)
+            return f"{self.file_id}{self.extension}"
 
     @property
     def _template_vars(self) -> dict[str, str]:
+        # Get the parent page ID (last ancestor)
+        page_id = self.ancestors[-1] if self.ancestors else 0
+        page = Page.from_id(page_id) if page_id else None
+
+        if page:
+            # Use the page's ancestor hierarchy for consistency
+            page_title = sanitize_filename(page.title)
+            ancestor_ids = "/".join(str(a) for a in page.ancestors)
+            ancestor_titles = "/".join(
+                sanitize_filename(Page.from_id(a).title) for a in page.ancestors
+            )
+        else:
+            page_title = ""
+            ancestor_ids = ""
+            ancestor_titles = ""
+
         return {
-            **super()._template_vars,
+            "space_key": sanitize_filename(self.space.key),
+            "space_name": sanitize_filename(self.space.name),
+            "homepage_id": str(self.space.homepage),
+            "homepage_title": sanitize_filename(Page.from_id(self.space.homepage).title),
+            "ancestor_ids": ancestor_ids,  # Override with page's ancestors
+            "ancestor_titles": ancestor_titles,  # Override with page's ancestors
+            "page_id": str(page_id),
+            "page_title": page_title,
             "attachment_id": str(self.id),
             "attachment_title": sanitize_filename(self.title),
             # file_id is a GUID and does not need sanitized.
             "attachment_file_id": self.file_id,
             "attachment_extension": self.extension,
+            # New: filename respects the attachment_naming configuration
+            "attachment_filename": self.filename,
         }
 
     @property
@@ -287,12 +322,8 @@ class Attachment(Document):
         # Choose subfolder based on file type
         subfolder = "img" if is_image else "files"
 
-        # Build filename - use file_id if available, otherwise use sanitized title
-        if self.file_id:
-            filename = self.filename
-        else:
-            # Fallback to title-based filename when file_id is missing
-            filename = sanitize_filename(self.title) + extension
+        # Build filename - use the configured naming strategy
+        filename = self.filename
 
         # Build path: static/img/space-name/filename or static/files/space-name/filename
         space_folder = sanitize_filename(self.space.key.lower())
@@ -1141,14 +1172,30 @@ class Page(Document):
         def convert_column_layout(
             self, el: BeautifulSoup, text: str, parent_tags: list[str]
         ) -> str:
+            """Convert Confluence column layouts to sequential markdown.
+
+            Column layouts are visual containers used in Confluence for side-by-side content.
+            Since markdown doesn't have native column support and converting to tables
+            creates malformed output, we render cells sequentially instead.
+            """
             cells = el.find_all("div", {"class": "cell"})
 
             if len(cells) < 2:  # noqa: PLR2004
                 return super().convert_div(el, text, parent_tags)
 
-            html = f"<table><tr>{''.join([f'<td>{cell!s}</td>' for cell in cells])}</tr></table>"
+            # Process each cell's content sequentially instead of as a table
+            result_parts = []
+            for cell in cells:
+                # Find the innerCell div which contains the actual content
+                inner_cell = cell.find("div", {"class": "innerCell"})
+                if inner_cell:
+                    # Process the inner cell content
+                    cell_content = self.process_tag(inner_cell, parent_tags)
+                    if cell_content and cell_content.strip():
+                        result_parts.append(cell_content)
 
-            return self.convert_table(BeautifulSoup(html, "html.parser"), text, parent_tags)
+            # Join cells with double newline for proper markdown separation
+            return "\n\n".join(result_parts)
 
         def convert_jira_table(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             jira_tables = BeautifulSoup(self.page.body_export, "html.parser").find_all(
@@ -1334,8 +1381,13 @@ class Page(Document):
 
         def convert_img(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             attachment = None
+            # Try data-media-id first (file_id)
             if fid := el.get("data-media-id"):
                 attachment = self.page.get_attachment_by_file_id(str(fid))
+
+            # Try data-linked-resource-id (attachment ID) if not found
+            if attachment is None and (resource_id := el.get("data-linked-resource-id")):
+                attachment = self.page.get_attachment_by_id(str(resource_id))
 
             url_src = str(el.get("src", ""))
 
