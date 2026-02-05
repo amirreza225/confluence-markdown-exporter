@@ -8,6 +8,8 @@ import requests
 from atlassian import Confluence as ConfluenceApiSdk
 from atlassian import Jira as JiraApiSdk
 from questionary import Style
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from confluence_markdown_exporter.utils.app_data_store import ApiDetails
 from confluence_markdown_exporter.utils.app_data_store import get_settings
@@ -30,6 +32,27 @@ def response_hook(
             f"Response headers: {dict(response.headers)}"
         )
     return response
+
+
+def configure_session_pool(session: requests.Session, max_connections: int = 10) -> None:
+    """Configure connection pooling for better HTTP performance.
+
+    Args:
+        session: The requests Session to configure.
+        max_connections: Maximum number of connections to keep in the pool.
+    """
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(
+        pool_connections=max_connections,
+        pool_maxsize=max_connections,
+        max_retries=retry_strategy,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
 
 
 class ApiClientFactory:
@@ -75,6 +98,10 @@ def get_confluence_instance() -> ConfluenceApiSdk:
     auth = settings.auth
     connection_config = settings.connection_config.model_dump()
 
+    # Get performance config for pool sizing
+    perf_config = getattr(settings, "performance", None)
+    max_connections = perf_config.max_workers if perf_config else 4
+
     while True:
         try:
             confluence = ApiClientFactory(connection_config).create_confluence(auth.confluence)
@@ -87,6 +114,9 @@ def get_confluence_instance() -> ConfluenceApiSdk:
             main_config_menu_loop("auth.confluence")
             settings = get_settings()
             auth = settings.auth
+
+    # Configure connection pooling for better parallel performance
+    configure_session_pool(confluence._session, max_connections)
 
     if DEBUG:
         confluence.session.hooks["response"] = [response_hook]

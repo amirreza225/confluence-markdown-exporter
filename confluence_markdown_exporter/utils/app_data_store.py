@@ -265,6 +265,15 @@ class ExportConfig(BaseModel):
             "For example, 'Parent.md' with children becomes 'Parent/home.md'."
         ),
     )
+    tables_as_html: bool = Field(
+        default=False,
+        title="Export Tables as HTML",
+        description=(
+            "Export tables as HTML <table> tags instead of markdown tables. "
+            "This allows code blocks and other complex content inside table cells, "
+            "which is not supported by standard markdown tables."
+        ),
+    )
 
 
 class DocusaurusConfig(BaseModel):
@@ -317,6 +326,44 @@ class DocusaurusConfig(BaseModel):
     )
 
 
+class PerformanceConfig(BaseModel):
+    """Performance tuning configuration."""
+
+    max_workers: int = Field(
+        default=1,
+        ge=1,
+        le=32,
+        title="Max Worker Threads",
+        description="Maximum concurrent threads for I/O operations. Use 1 for Confluence Cloud to avoid rate limits.",
+    )
+    rate_limit_delay: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=5.0,
+        title="Rate Limit Delay",
+        description="Delay between page exports in seconds to avoid rate limiting.",
+    )
+    rate_limit_jitter: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=2.0,
+        title="Rate Limit Jitter",
+        description="Random jitter added to delay (0 to this value) to distribute requests.",
+    )
+    enable_parallel_export: bool = Field(
+        default=True,
+        title="Enable Parallel Export",
+        description="Enable parallel page export using ThreadPoolExecutor.",
+    )
+    prefetch_batch_size: int = Field(
+        default=50,
+        ge=10,
+        le=200,
+        title="Prefetch Batch Size",
+        description="Number of pages to prefetch concurrently before export.",
+    )
+
+
 class ConfigModel(BaseModel):
     """Top-level application configuration model."""
 
@@ -327,6 +374,9 @@ class ConfigModel(BaseModel):
     auth: AuthConfig = Field(default_factory=AuthConfig, title="Authentication")
     docusaurus: DocusaurusConfig = Field(
         default_factory=DocusaurusConfig, title="Docusaurus Configuration"
+    )
+    performance: PerformanceConfig = Field(
+        default_factory=PerformanceConfig, title="Performance Configuration"
     )
 
 
@@ -354,6 +404,7 @@ def get_settings() -> ConfigModel:
         connection_config=ConnectionConfig(**data.get("connection_config", {})),
         auth=AuthConfig(**data.get("auth", {})),
         docusaurus=DocusaurusConfig(**data.get("docusaurus", {})),
+        performance=PerformanceConfig(**data.get("performance", {})),
     )
 
 

@@ -8,10 +8,15 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import sys
+import threading
+import time
 import urllib.parse
 from collections.abc import Set
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
 from os import PathLike
 from pathlib import Path
 from string import Template
@@ -49,6 +54,17 @@ StrPath: TypeAlias = str | PathLike[str]
 DEBUG: bool = str_to_bool(os.getenv("DEBUG", "False"))
 
 logger = logging.getLogger(__name__)
+
+# Pre-compiled regex patterns for performance
+_MDX_TAG_PATTERN = re.compile(r"<([^>]+)>")
+_MDX_ANGLE_BRACKET_PATTERN = re.compile(r"<(?! )[^>]+>")
+_CODE_BRUSH_PATTERN = re.compile(r"brush:\s*([^;]+)")
+_SLUG_SPECIAL_CHARS = re.compile(r"[^a-z0-9\s-]")
+_SLUG_WHITESPACE = re.compile(r"\s+")
+_WIKI_PAGES_PATTERN = re.compile(r"/wiki/.+?/pages/(\d+)")
+_VIEWPAGE_PATTERN = re.compile(r"[/]pages/viewpage\.action\?pageId=(\d+)")
+_ATTACHMENT_URL_PATTERN = re.compile(r"/download/(?:attachments|thumbnails)/(\d+)/([^?]+)")
+_YAML_INDENT_PATTERN = re.compile(r"^( *)(- )", re.MULTILINE)
 
 # Increase recursion limit to handle deeply nested Confluence page structures
 # Default is 1000, we increase to 5000 to handle complex pages
@@ -220,6 +236,11 @@ class Document(BaseModel):
     space: Space
     ancestors: list[int]
 
+    @functools.cached_property
+    def _ancestor_titles_cached(self) -> list[str]:
+        """Get sanitized ancestor titles (cached)."""
+        return [sanitize_filename(Page.from_id(a).title) for a in self.ancestors]
+
     @property
     def _template_vars(self) -> dict[str, str]:
         return {
@@ -228,9 +249,7 @@ class Document(BaseModel):
             "homepage_id": str(self.space.homepage),
             "homepage_title": sanitize_filename(Page.from_id(self.space.homepage).title),
             "ancestor_ids": "/".join(str(a) for a in self.ancestors),
-            "ancestor_titles": "/".join(
-                sanitize_filename(Page.from_id(a).title) for a in self.ancestors
-            ),
+            "ancestor_titles": "/".join(self._ancestor_titles_cached),
         }
 
 
@@ -261,12 +280,12 @@ class Attachment(Document):
         if naming_strategy == "title":
             # Use sanitized attachment title to prevent hidden files
             return f"{sanitize_filename(self.title)}{self.extension}"
-        elif naming_strategy == "id":
+        if naming_strategy == "id":
             # Use attachment ID (always safe and unique)
             return f"{self.id}{self.extension}"
-        else:  # "file_id"
-            # Use file_id (may create hidden files if empty, but preserves original behavior)
-            return f"{self.file_id}{self.extension}"
+        # "file_id"
+        # Use file_id (may create hidden files if empty, but preserves original behavior)
+        return f"{self.file_id}{self.extension}"
 
     @property
     def _template_vars(self) -> dict[str, str]:
@@ -402,8 +421,9 @@ class Page(Document):
     labels: list["Label"]
     attachments: list["Attachment"]
 
-    @property
+    @functools.cached_property
     def descendants(self) -> list[int]:
+        """Get all descendant page IDs (cached after first access)."""
         url = "rest/api/content/search"
         params = {
             "cql": f"type=page AND ancestor={self.id}",
@@ -435,6 +455,11 @@ class Page(Document):
             return []
 
         return [result["id"] for result in results]
+
+    @functools.cached_property
+    def body_export_soup(self) -> BeautifulSoup:
+        """Parsed BeautifulSoup of body_export (cached)."""
+        return BeautifulSoup(self.body_export, "html.parser")
 
     @property
     def _template_vars(self) -> dict[str, str]:
@@ -490,16 +515,38 @@ class Page(Document):
     def _generate_docusaurus_slug(title: str) -> str:
         """Generate URL-safe slug from title for Docusaurus."""
         slug = title.lower()
-        slug = re.sub(r'[^a-z0-9\s-]', '', slug)
-        slug = re.sub(r'\s+', '-', slug)
+        slug = _SLUG_SPECIAL_CHARS.sub("", slug)
+        slug = _SLUG_WHITESPACE.sub("-", slug)
         slug = slug.strip('-')
         return slug if slug else 'untitled'
 
     @property
     def html(self) -> str:
+        import re
+        body = self.body
+
+        # Pre-process HTML to remove empty code blocks that only contain <br> tags
+        # Confluence sometimes has <pre class="de1"><br></pre> elements that create
+        # empty code blocks when converted to markdown
+        # Pattern matches: <pre...> with only <br>, whitespace, or nothing inside </pre>
+        body = re.sub(
+            r'<pre[^>]*>\s*(?:<br\s*/?>\s*)*</pre>',
+            '',
+            body,
+            flags=re.IGNORECASE
+        )
+
+        # Also remove empty mw-geshi/mw-code divs that wrap these empty pre elements
+        body = re.sub(
+            r'<div[^>]*class="[^"]*mw-geshi[^"]*"[^>]*>\s*<div[^>]*>\s*</div>\s*</div>',
+            '',
+            body,
+            flags=re.IGNORECASE
+        )
+
         if settings.export.include_document_title:
-            return f"<h1>{self.title}</h1>{self.body}"
-        return self.body
+            return f"<h1>{self.title}</h1>{body}"
+        return body
 
     @property
     def markdown(self) -> str:
@@ -582,33 +629,83 @@ class Page(Document):
         )
 
     def export_attachments(self) -> None:
-        if settings.export.attachment_export_all:
-            for attachment in self.attachments:
-                attachment.export()
+        """Export attachments with optional parallelism."""
+        attachments_to_export = self._get_attachments_to_export()
+
+        if not attachments_to_export:
+            return
+
+        perf_config = getattr(settings, "performance", None)
+
+        # Use parallel export if enabled and multiple attachments
+        if (
+            perf_config
+            and perf_config.enable_parallel_export
+            and len(attachments_to_export) > 1
+        ):
+            self._export_attachments_parallel(attachments_to_export, perf_config.max_workers)
         else:
-            for attachment in self.attachments:
-                if (
-                    attachment.filename.endswith(".drawio")
-                    and f"diagramName={attachment.title}" in self.body
-                ):
-                    attachment.export()
-                    continue
-                if (
-                    attachment.filename.endswith(".drawio.png")
-                    or attachment.filename.endswith(".drawio")
-                ) and attachment.title.replace(" ", "%20") in self.body_export:
-                    attachment.export()
-                    continue
-                if attachment.file_id in self.body:
-                    attachment.export()
-                    continue
+            for attachment in attachments_to_export:
+                attachment.export()
+
+    def _get_attachments_to_export(self) -> list["Attachment"]:
+        """Determine which attachments need to be exported."""
+        if settings.export.attachment_export_all:
+            return list(self.attachments)
+
+        attachments_to_export = []
+        for attachment in self.attachments:
+            if (
+                attachment.filename.endswith(".drawio")
+                and f"diagramName={attachment.title}" in self.body
+            ):
+                attachments_to_export.append(attachment)
+                continue
+            if (
+                attachment.filename.endswith(".drawio.png")
+                or attachment.filename.endswith(".drawio")
+            ) and attachment.title.replace(" ", "%20") in self.body_export:
+                attachments_to_export.append(attachment)
+                continue
+            if attachment.file_id in self.body:
+                attachments_to_export.append(attachment)
+                continue
+        return attachments_to_export
+
+    def _export_attachments_parallel(
+        self, attachments: list["Attachment"], max_workers: int
+    ) -> None:
+        """Export attachments in parallel using ThreadPoolExecutor."""
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(attachments))) as executor:
+            futures = [executor.submit(att.export) for att in attachments]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.warning(f"Failed to export attachment: {e}")
+
+    @functools.cached_property
+    def _attachment_index(self) -> dict[str, "Attachment"]:
+        """Index attachments by id and file_id for O(1) lookup."""
+        index: dict[str, Attachment] = {}
+        for a in self.attachments:
+            index[a.id] = a
+            if a.file_id:
+                index[a.file_id] = a
+        return index
 
     def get_attachment_by_id(self, attachment_id: str) -> Attachment | None:
         """Get the Attachment object by its ID.
 
         Confluence Server sometimes stores attachments without a file_id.
         Fall back to the plain attachment.id and return None if nothing matches.
+        Uses cached index for O(1) lookup with fallback to linear search for partial matches.
         """
+        # Try exact match first (O(1))
+        if attachment_id in self._attachment_index:
+            return self._attachment_index[attachment_id]
+
+        # Fall back to partial match (O(n)) for backward compatibility
         for a in self.attachments:
             if attachment_id in a.id:
                 return a
@@ -617,6 +714,12 @@ class Page(Document):
         return None
 
     def get_attachment_by_file_id(self, file_id: str) -> Attachment | None:
+        """Get the Attachment object by its file_id (O(1) lookup with partial match fallback)."""
+        # Try exact match first (O(1))
+        if file_id in self._attachment_index:
+            return self._attachment_index[file_id]
+
+        # Fall back to partial match (O(n)) for backward compatibility
         for a in self.attachments:
             if a.file_id and file_id in a.file_id:
                 return a
@@ -682,7 +785,7 @@ class Page(Document):
             confluence = get_confluence_instance()  # Refresh instance with new URL
 
         path = url.path.rstrip("/")
-        if match := re.search(r"/wiki/.+?/pages/(\d+)", path):
+        if match := _WIKI_PAGES_PATTERN.search(path):
             page_id = match.group(1)
             return Page.from_id(int(page_id))
 
@@ -716,59 +819,118 @@ class Page(Document):
         def markdown(self) -> str:
             md_body = self.convert(self.page.html)
 
-            # Apply MDX escaping if Docusaurus mode is enabled
-            if settings.docusaurus.enabled:
-                if DEBUG:
-                    print(f"\n{'='*80}")
-                    print(f"MDX ESCAPING for page: {self.page.title}")
-                    print(f"Docusaurus enabled: {settings.docusaurus.enabled}")
-                    print(f"{'='*80}\n")
-                # Simple approach: Replace ALL angle brackets and curly braces outside of code blocks
-                lines = []
-                in_code_block = False
-                line_num = 0
-                for line in md_body.split('\n'):
-                    line_num += 1
-                    # Track code blocks
-                    if line.strip().startswith('```'):
-                        in_code_block = not in_code_block
-                        if DEBUG:
-                            print(f"Line {line_num}: CODE BLOCK {'OPENED' if in_code_block else 'CLOSED'}")
-                        lines.append(line)
-                        continue
+            # Clean up <br/> tags that can appear in table cell code blocks
+            # These patterns specifically target problematic <br/> placements around code fences
+            import re
 
-                    if in_code_block:
-                        if DEBUG and ('<' in line or '>' in line):
-                            print(f"Line {line_num}: SKIPPING (inside code block): {line[:100]}")
-                        lines.append(line)
-                        continue
+            # CRITICAL: Remove complete empty code block sequences first
+            # Pattern: ```lang<br/>``` or ```<br/>```lang → (removed entirely)
+            md_body = re.sub(r'```[a-zA-Z0-9]*\s*<br\s*/>\s*```[a-zA-Z0-9]*\s*', '', md_body)
 
-                    # Outside code blocks: escape ALL angle brackets and curly braces
-                    # This is aggressive but guaranteed to work - escapes even in inline code
-                    # which is safe since HTML entities render correctly in MDX inline code
-                    has_angle = '<' in line or '>' in line
-                    escaped_line = (line
-                        .replace('<', '&lt;')
-                        .replace('>', '&gt;')
-                        .replace('{', '&#123;')
-                        .replace('}', '&#125;'))
-                    if DEBUG and has_angle:
+            # Remove <br/> adjacent to code fences (only for fenced code blocks outside tables)
+            # Pattern 1: <br/> before opening fence → newline
+            md_body = re.sub(r'<br\s*/>\s*(```)', r'\n\1', md_body)
+            # Pattern 2: <br/> after closing fence → newline
+            md_body = re.sub(r'(```)\s*<br\s*/>', r'\1\n', md_body)
+
+            # NOTE: We do NOT convert remaining <br/> to newlines anymore.
+            # Table cells use <br/> to preserve structure, and code blocks inside
+            # table cells now use HTML <pre><code> format with <br> for line breaks.
+
+            # Escape angle brackets for XML-like tags in content (e.g., <schedule>, <workFolders>)
+            # These need to be escaped so they render as text, not as HTML/JSX
+            # BUT: preserve intentional HTML structure tags we output for tables and code blocks
+            if DEBUG:
+                print(f"\n{'='*80}")
+                print(f"ESCAPING ANGLE BRACKETS for page: {self.page.title}")
+                print(f"{'='*80}\n")
+
+            lines = []
+            in_code_block = False
+            line_num = 0
+
+            for line in md_body.split('\n'):
+                line_num += 1
+
+                # Count code fence markers (```) in the line to track code block state
+                fence_count = line.count('```')
+
+                # Toggle code block state for each fence encountered
+                for _ in range(fence_count):
+                    in_code_block = not in_code_block
+                    if DEBUG:
+                        print(f"Line {line_num}: CODE BLOCK {'OPENED' if in_code_block else 'CLOSED'} (fence found)")
+
+                # If we started IN a code block and ended IN a code block after processing fences,
+                # then this line has content inside a code block
+                started_in_block = not in_code_block if fence_count % 2 == 1 else in_code_block
+
+                # Skip escaping if the line has any code block content
+                if fence_count > 0 or started_in_block:
+                    if DEBUG and ('<' in line or '>' in line):
+                        print(f"Line {line_num}: SKIPPING (code block line): {line[:100]}")
+                    lines.append(line)
+                    continue
+
+                # Outside code blocks: escape angle brackets with backslash
+                has_angle = '<' in line and '>' in line
+
+                if has_angle:
+                    # Replace > with \> in patterns that look like tags
+                    # BUT: preserve intentional HTML structure tags
+                    def escape_tag(match):
+                        tag_content = match.group(1)
+                        # Preserve HTML tags for tables, code blocks, and formatting
+                        preserved_tags = (
+                            # Code and preformatted
+                            "pre", "/pre", "code", "/code", "br", "br/",
+                            # Tables
+                            "table", "/table", "tr", "/tr", "td", "/td", "th", "/th",
+                            "thead", "/thead", "tbody", "/tbody",
+                            # Lists
+                            "ul", "/ul", "ol", "/ol", "li", "/li",
+                            # Collapsible sections
+                            "details", "/details", "summary", "/summary",
+                            # Links and images
+                            "a", "/a", "img",
+                            # Text formatting
+                            "strong", "/strong", "b", "/b",
+                            "em", "/em", "i", "/i",
+                            "u", "/u", "s", "/s", "del", "/del",
+                            "sub", "/sub", "sup", "/sup",
+                            # Block elements
+                            "p", "/p", "div", "/div", "span", "/span",
+                            "blockquote", "/blockquote",
+                            # Headings
+                            "h1", "/h1", "h2", "/h2", "h3", "/h3",
+                            "h4", "/h4", "h5", "/h5", "h6", "/h6",
+                        )
+                        if tag_content in preserved_tags:
+                            return match.group(0)  # Return unchanged
+                        # Preserve tags with attributes (e.g., <a href="...">, <img src="...">)
+                        tags_with_attrs = ("code ", "td ", "th ", "a ", "img ", "span ", "div ", "p ")
+                        for prefix in tags_with_attrs:
+                            if tag_content.startswith(prefix):
+                                return match.group(0)  # Return unchanged
+                        # Escape other tags (XML-like content tags)
+                        return f"<{tag_content}\\>"
+
+                    escaped_line = _MDX_TAG_PATTERN.sub(escape_tag, line)
+                    if DEBUG:
                         print(f"Line {line_num}: ESCAPING (outside code block)")
                         print(f"  BEFORE: {line[:100]}")
                         print(f"  AFTER:  {escaped_line[:100]}")
                     lines.append(escaped_line)
-                md_body = '\n'.join(lines)
+                else:
+                    lines.append(line)
 
-                if DEBUG:
-                    # Count remaining unescaped brackets
-                    unescaped_lt = md_body.count('<') - md_body.count('&lt;')
-                    unescaped_gt = md_body.count('>') - md_body.count('&gt;')
-                    print(f"\n{'-'*80}")
-                    print(f"ESCAPING COMPLETE for {self.page.title}")
-                    print(f"Total lines processed: {line_num}")
-                    print(f"Remaining '<' after escaping: {unescaped_lt}")
-                    print(f"Remaining '>' after escaping: {unescaped_gt}")
-                    print(f"{'-'*80}\n")
+            md_body = '\n'.join(lines)
+
+            if DEBUG:
+                print(f"\n{'-'*80}")
+                print(f"ESCAPING COMPLETE for {self.page.title}")
+                print(f"Total lines processed: {line_num}")
+                print(f"{'-'*80}\n")
 
             markdown = f"{self.front_matter}\n"
             if settings.export.page_breadcrumbs:
@@ -881,7 +1043,7 @@ class Page(Document):
             # - <word/> - self-closing tag
             # Pattern: < followed by non-whitespace content and ending with >
             # Exclude < followed by space (comparison operators)
-            text = re.sub(r'<(?! )[^>]+>', replace_angle_brackets, text)
+            text = _MDX_ANGLE_BRACKET_PATTERN.sub(replace_angle_brackets, text)
 
             return text
 
@@ -901,13 +1063,13 @@ class Page(Document):
 
             yml = yaml.dump(self.page_properties, indent=indent).strip()
             # Indent the root level list items
-            yml = re.sub(r"^( *)(- )", r"\1" + " " * indent + r"\2", yml, flags=re.MULTILINE)
+            yml = _YAML_INDENT_PATTERN.sub(r"\1" + " " * indent + r"\2", yml)
             return f"---\n{yml}\n---\n"
 
         def _add_docusaurus_frontmatter(self) -> None:
             """Add Docusaurus-specific frontmatter fields."""
             # Generate ID from title (slugified)
-            doc_id = self._generate_slug(self.page.title)
+            doc_id = Page._generate_docusaurus_slug(self.page.title)
             self.set_page_properties(id=doc_id)
 
             # Extract description from first paragraph
@@ -930,18 +1092,6 @@ class Page(Document):
             if self.page.labels:
                 tags = self._convert_labels_to_tags()
                 self.set_page_properties(tags=tags)
-
-        def _generate_slug(self, title: str) -> str:
-            """Convert title to URL-safe slug for Docusaurus ID."""
-            # Convert to lowercase
-            slug = title.lower()
-            # Remove special characters (keep alphanumeric and spaces)
-            slug = re.sub(r'[^a-z0-9\s-]', '', slug)
-            # Replace spaces with hyphens
-            slug = re.sub(r'\s+', '-', slug)
-            # Remove leading/trailing hyphens
-            slug = slug.strip('-')
-            return slug if slug else 'untitled'
 
         def _extract_description(self, html_content: str, max_length: int = 160) -> str:
             """Extract first paragraph from HTML content for description."""
@@ -1032,8 +1182,7 @@ class Page(Document):
 
             if settings.docusaurus.enabled:
                 return self._convert_to_docusaurus_admonition(el, text, macro_name, parent_tags)
-            else:
-                return self._convert_to_github_alert(el, text, macro_name, parent_tags)
+            return self._convert_to_github_alert(el, text, macro_name, parent_tags)
 
         def _convert_to_docusaurus_admonition(
             self, el: BeautifulSoup, text: str, macro_name: str, parent_tags: list[str]
@@ -1113,6 +1262,7 @@ class Page(Document):
                     "toc": self.convert_toc,
                     "jira": self.convert_jira_table,
                     "attachments": self.convert_attachments,
+                    "code": self.convert_code_macro,
                 }
                 if macro_name in macro_handlers:
                     return macro_handlers[macro_name](el, text, parent_tags)
@@ -1211,7 +1361,7 @@ class Page(Document):
             return "\n\n".join(result_parts)
 
         def convert_jira_table(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
-            jira_tables = BeautifulSoup(self.page.body_export, "html.parser").find_all(
+            jira_tables = self.page.body_export_soup.find_all(
                 "div", {"class": "jira-table"}
             )
 
@@ -1226,7 +1376,7 @@ class Page(Document):
             return self.process_tag(jira_tables[0], parent_tags)
 
         def convert_toc(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
-            tocs = BeautifulSoup(self.page.body_export, "html.parser").find_all(
+            tocs = self.page.body_export_soup.find_all(
                 "div", {"class": "toc-macro"}
             )
 
@@ -1260,17 +1410,124 @@ class Page(Document):
             except HTTPError:
                 return f"[[{issue_key}]]({link.get('href')})"
 
+        def convert_code_macro(
+            self, el: BeautifulSoup, text: str, parent_tags: list[str]
+        ) -> str:
+            """Convert Confluence code macro to markdown or HTML based on context.
+
+            When inside a table cell, uses HTML <pre><code> to preserve table structure.
+            Otherwise, uses standard markdown code fences.
+
+            IMPORTANT: We extract content directly from raw HTML, ignoring the `text`
+            parameter which may contain malformed output from markdownify's child processing.
+            """
+            import html as html_module
+
+            language = ""
+            code_content = ""
+
+            # Method 1: Try syntaxhighlighter structure (modern Confluence)
+            highlighter = el.find("div", class_="syntaxhighlighter")
+            if highlighter:
+                classes = highlighter.get("class", [])
+                if isinstance(classes, list):
+                    for cls in classes:
+                        if cls not in ["syntaxhighlighter", "sh-default", "nogutter"]:
+                            language = cls
+                            break
+
+                container = el.find("div", class_="container")
+                if container:
+                    code_lines = []
+                    for line_div in container.find_all("div", class_="line"):
+                        line_text = "".join(code.get_text() for code in line_div.find_all("code"))
+                        code_lines.append(line_text)
+                    if code_lines:
+                        code_content = "\n".join(code_lines)
+
+            # Method 2: Try <pre> element directly (simpler Confluence structures)
+            if not code_content:
+                pre_element = el.find("pre")
+                if pre_element:
+                    # Get raw text content from pre, not markdownify's processed text
+                    code_content = pre_element.get_text()
+                    # Try to get language from data-syntaxhighlighter-params
+                    if pre_element.has_attr("data-syntaxhighlighter-params"):
+                        match = _CODE_BRUSH_PATTERN.search(
+                            str(pre_element["data-syntaxhighlighter-params"])
+                        )
+                        if match:
+                            language = match.group(1)
+
+            # Method 3: Last resort - get all text content from the code macro
+            if not code_content:
+                code_content = el.get_text().strip()
+
+            # If inside a table cell, use HTML to preserve table structure
+            if "td" in parent_tags:
+                escaped_content = html_module.escape(code_content)
+                escaped_content = escaped_content.replace("\n", "<br>")
+                lang_attr = f' class="language-{language}"' if language else ""
+                return f"<pre><code{lang_attr}>{escaped_content}</code></pre>"
+
+            # Outside table cells, use standard markdown code fences
+            return f"\n\n```{language}\n{code_content}\n```\n\n"
+
         def convert_pre(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             if not text:
                 return ""
 
+            import html as html_module
+
+            # Check if this pre is inside a code macro - if so, return empty
+            # because convert_code_macro will handle the extraction from raw HTML
+            parent = el.parent
+            while parent:
+                if hasattr(parent, "get") and parent.get("data-macro-name") == "code":
+                    # This pre is inside a code macro, skip processing
+                    # (convert_code_macro will extract content directly from HTML)
+                    return ""
+                parent = getattr(parent, "parent", None)
+
             code_language = ""
             if el.has_attr("data-syntaxhighlighter-params"):
-                match = re.search(r"brush:\s*([^;]+)", str(el["data-syntaxhighlighter-params"]))
+                match = _CODE_BRUSH_PATTERN.search(str(el["data-syntaxhighlighter-params"]))
                 if match:
                     code_language = match.group(1)
 
+            # If inside a table cell, use HTML to preserve table structure
+            if "td" in parent_tags:
+                escaped_content = html_module.escape(text)
+                escaped_content = escaped_content.replace("\n", "<br>")
+                lang_attr = f' class="language-{code_language}"' if code_language else ""
+                return f"<pre><code{lang_attr}>{escaped_content}</code></pre>"
+
             return f"\n\n```{code_language}\n{text}\n```\n\n"
+
+        def convert_code(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
+            """Convert code elements, avoiding backticks when inside a code macro.
+
+            Code macros have their own handling via convert_code_macro which extracts
+            content directly from HTML. The <code> elements inside syntaxhighlighters
+            should NOT be wrapped in backticks.
+            """
+            # Check if this code element is inside a code macro
+            parent = el.parent
+            while parent:
+                if hasattr(parent, "get") and parent.get("data-macro-name") == "code":
+                    # Inside a code macro - return just the text, no backticks
+                    return text
+                # Also check for syntaxhighlighter class (code macro's internal structure)
+                if hasattr(parent, "get"):
+                    classes = parent.get("class", [])
+                    if isinstance(classes, list) and "syntaxhighlighter" in classes:
+                        return text
+                    if isinstance(classes, str) and "syntaxhighlighter" in classes:
+                        return text
+                parent = getattr(parent, "parent", None)
+
+            # Outside code macros, use default inline code formatting
+            return f"`{text}`"
 
         def convert_sub(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             return f"<sub>{text}</sub>"
@@ -1306,11 +1563,11 @@ class Page(Document):
                 # convert_attachment_link may return None if the attachment meta is incomplete
                 return link or f"[{text}]({el.get('href')})"
             # Handle /wiki/.../pages/123 pattern
-            if match := re.search(r"/wiki/.+?/pages/(\d+)", str(el.get("href", ""))):
+            if match := _WIKI_PAGES_PATTERN.search(str(el.get("href", ""))):
                 page_id = match.group(1)
                 return self.convert_page_link(int(page_id))
             # Handle /pages/viewpage.action?pageId=123 pattern
-            if match := re.search(r"[/]pages/viewpage\.action\?pageId=(\d+)", str(el.get("href", ""))):
+            if match := _VIEWPAGE_PATTERN.search(str(el.get("href", ""))):
                 page_id = match.group(1)
                 return self.convert_page_link(int(page_id))
             if str(el.get("href", "")).startswith("#"):
@@ -1418,7 +1675,7 @@ class Page(Document):
             # Try to extract attachment from Confluence URLs if attachment is still None
             if attachment is None and url_src:
                 # Try to extract attachment ID from /download/attachments/<id>/filename or /download/thumbnails/<id>/filename
-                if match := re.search(r"/download/(?:attachments|thumbnails)/(\d+)/([^?]+)", url_src):
+                if match := _ATTACHMENT_URL_PATTERN.search(url_src):
                     attachment_id = match.group(1)
                     filename = unquote(match.group(2))
                     # Try to find attachment by ID
@@ -1569,7 +1826,162 @@ class Page(Document):
             if el.has_attr("class") and "metadata-summary-macro" in el["class"]:
                 return self.convert_page_properties_report(el, text, parent_tags)
 
+            # If tables_as_html is enabled, output HTML table instead of markdown
+            if settings.export.tables_as_html:
+                return self._convert_table_as_html(el, text, parent_tags)
+
             return super().convert_table(el, text, parent_tags)
+
+        def _convert_table_as_html(
+            self, el: BeautifulSoup, text: str, parent_tags: list[str]
+        ) -> str:
+            """Convert table to HTML format, preserving code blocks and other content.
+
+            This outputs a proper HTML <table> with HTML-formatted cell content,
+            allowing code blocks and other complex content that markdown tables
+            cannot support.
+            """
+            rows = el.find_all("tr")
+            if not rows:
+                return ""
+
+            html_rows = []
+            for row in rows:
+                cells = row.find_all(["td", "th"])
+                html_cells = []
+                for cell in cells:
+                    tag_name = cell.name
+                    # Convert cell content to clean HTML (not markdown)
+                    cell_content = self._convert_cell_to_html(cell)
+                    # Get cell attributes (colspan, rowspan)
+                    attrs = []
+                    if cell.get("colspan"):
+                        attrs.append(f'colspan="{cell.get("colspan")}"')
+                    if cell.get("rowspan"):
+                        attrs.append(f'rowspan="{cell.get("rowspan")}"')
+                    attr_str = " " + " ".join(attrs) if attrs else ""
+                    html_cells.append(f"<{tag_name}{attr_str}>{cell_content}</{tag_name}>")
+                html_rows.append("<tr>" + "".join(html_cells) + "</tr>")
+
+            return "\n\n<table>\n" + "\n".join(html_rows) + "\n</table>\n\n"
+
+        def _convert_cell_to_html(self, cell: BeautifulSoup) -> str:
+            """Convert table cell content to clean HTML format.
+
+            Processes Confluence HTML and outputs clean HTML suitable for
+            embedding in an HTML table. Uses HTML tags instead of markdown.
+            """
+            import html as html_module
+            from bs4 import NavigableString, Tag
+
+            result_parts = []
+
+            for child in cell.children:
+                if isinstance(child, NavigableString):
+                    # Text content - escape HTML entities
+                    text = str(child).strip()
+                    if text:
+                        result_parts.append(html_module.escape(text))
+
+                elif isinstance(child, Tag):
+                    # Process different HTML elements
+                    if child.name == "p":
+                        inner = self._convert_cell_to_html(child)
+                        if inner:
+                            result_parts.append(inner + "<br/>")
+
+                    elif child.name in ("strong", "b"):
+                        inner = self._convert_cell_to_html(child)
+                        result_parts.append(f"<strong>{inner}</strong>")
+
+                    elif child.name in ("em", "i"):
+                        inner = self._convert_cell_to_html(child)
+                        result_parts.append(f"<em>{inner}</em>")
+
+                    elif child.name == "a":
+                        href = child.get("href", "")
+                        inner = self._convert_cell_to_html(child)
+                        result_parts.append(f'<a href="{href}">{inner}</a>')
+
+                    elif child.name == "img":
+                        src = child.get("src", "")
+                        alt = child.get("alt", "")
+                        result_parts.append(f'<img src="{src}" alt="{alt}"/>')
+
+                    elif child.name == "br":
+                        result_parts.append("<br/>")
+
+                    elif child.name == "code":
+                        inner = child.get_text()
+                        result_parts.append(f"<code>{html_module.escape(inner)}</code>")
+
+                    elif child.name == "pre":
+                        inner = child.get_text()
+                        result_parts.append(f"<pre>{html_module.escape(inner)}</pre>")
+
+                    elif child.name == "ul":
+                        result_parts.append(str(child))
+
+                    elif child.name == "ol":
+                        result_parts.append(str(child))
+
+                    elif child.name == "div":
+                        # Check for code macro
+                        if child.get("data-macro-name") == "code":
+                            code_content = self._extract_code_macro_content(child)
+                            language = self._extract_code_macro_language(child)
+                            # Keep actual newlines in pre/code - don't use <br>
+                            escaped = html_module.escape(code_content)
+                            lang_attr = f' class="language-{language}"' if language else ""
+                            result_parts.append(f"<pre><code{lang_attr}>{escaped}</code></pre>")
+                        else:
+                            # Recurse into div
+                            inner = self._convert_cell_to_html(child)
+                            if inner:
+                                result_parts.append(inner)
+
+                    elif child.name == "span":
+                        inner = self._convert_cell_to_html(child)
+                        result_parts.append(inner)
+
+                    else:
+                        # For other elements, recurse or get text
+                        inner = self._convert_cell_to_html(child)
+                        if inner:
+                            result_parts.append(inner)
+
+            return "".join(result_parts).strip()
+
+        def _extract_code_macro_content(self, el: BeautifulSoup) -> str:
+            """Extract code content from a Confluence code macro element."""
+            # Try syntaxhighlighter structure
+            container = el.find("div", class_="container")
+            if container:
+                code_lines = []
+                for line_div in container.find_all("div", class_="line"):
+                    line_text = "".join(code.get_text() for code in line_div.find_all("code"))
+                    code_lines.append(line_text)
+                if code_lines:
+                    return "\n".join(code_lines)
+
+            # Try pre element
+            pre = el.find("pre")
+            if pre:
+                return pre.get_text()
+
+            # Fallback to all text
+            return el.get_text().strip()
+
+        def _extract_code_macro_language(self, el: BeautifulSoup) -> str:
+            """Extract language from a Confluence code macro element."""
+            highlighter = el.find("div", class_="syntaxhighlighter")
+            if highlighter:
+                classes = highlighter.get("class", [])
+                if isinstance(classes, list):
+                    for cls in classes:
+                        if cls not in ["syntaxhighlighter", "sh-default", "nogutter"]:
+                            return cls
+            return ""
 
         def convert_page_properties_report(
             self, el: BeautifulSoup, text: str, parent_tags: list[str]
@@ -1577,7 +1989,7 @@ class Page(Document):
             data_cql = el.get("data-cql")
             if not data_cql:
                 return ""
-            soup = BeautifulSoup(self.page.body_export, "html.parser")
+            soup = self.page.body_export_soup
             table = soup.find("table", {"data-cql": data_cql})
             if not table:
                 return ""
@@ -1617,6 +2029,7 @@ class CategoryFileGenerator:
 
     def __init__(self) -> None:
         self.category_data: dict[str, dict] = {}
+        self._lock = threading.Lock()  # Thread safety for parallel exports
 
     def collect_category_info(self, page: "Page", position_index: int = 0) -> None:
         """Collect information about folders/categories during page processing."""
@@ -1634,34 +2047,35 @@ class CategoryFileGenerator:
         # Convert to absolute path for consistency
         folder_key = str(parent_folder)
 
-        if folder_key not in self.category_data:
-            # Get category label from parent page title
-            category_label = parent_folder.name
+        with self._lock:  # Thread-safe access to shared category_data
+            if folder_key not in self.category_data:
+                # Get category label from parent page title
+                category_label = parent_folder.name
 
-            # Try to get a better label from the parent page
-            if page.ancestors:
-                parent_page_id = page.ancestors[-1]
-                try:
-                    parent_page = Page.from_id(parent_page_id)
-                    category_label = parent_page.title
-                except Exception:
-                    pass
+                # Try to get a better label from the parent page
+                if page.ancestors:
+                    parent_page_id = page.ancestors[-1]
+                    try:
+                        parent_page = Page.from_id(parent_page_id)
+                        category_label = parent_page.title
+                    except Exception:
+                        pass
 
-            # Calculate position based on hierarchy depth
-            depth = len(page.ancestors)
-            position = depth * settings.docusaurus.sidebar_position_increment
+                # Calculate position based on hierarchy depth
+                depth = len(page.ancestors)
+                position = depth * settings.docusaurus.sidebar_position_increment
 
-            self.category_data[folder_key] = {
-                'label': category_label,
-                'position': position,
-                'pages': [],
-            }
+                self.category_data[folder_key] = {
+                    'label': category_label,
+                    'position': position,
+                    'pages': [],
+                }
 
-        # Add page to category
-        self.category_data[folder_key]['pages'].append({
-            'title': page.title,
-            'position': position_index
-        })
+            # Add page to category
+            self.category_data[folder_key]['pages'].append({
+                'title': page.title,
+                'position': position_index
+            })
 
     def generate_category_files(self) -> None:
         """Generate all _category_.json files after processing all pages."""
@@ -1711,7 +2125,6 @@ def export_page(page_id: int) -> None:
 
     Args:
         page_id: The page id.
-        output_path: The output path.
     """
     page = Page.from_id(page_id)
     page.export()
@@ -1721,21 +2134,101 @@ def export_page(page_id: int) -> None:
         get_category_generator().collect_category_info(page)
 
 
+def _export_page_worker(
+    page_id: int, rate_limit_delay: float, rate_limit_jitter: float
+) -> tuple[int, bool, str | None]:
+    """Worker function for parallel page export.
+
+    Args:
+        page_id: The page ID to export.
+        rate_limit_delay: Base delay between operations for rate limiting.
+        rate_limit_jitter: Maximum random jitter to add to delay.
+
+    Returns:
+        Tuple of (page_id, success, error_message)
+    """
+    try:
+        page = Page.from_id(page_id)
+        page.export()
+
+        # Collect category info for Docusaurus
+        if settings.docusaurus.enabled:
+            get_category_generator().collect_category_info(page)
+
+        # Apply rate limiting with jitter to distribute requests
+        if rate_limit_delay > 0 or rate_limit_jitter > 0:
+            jitter = random.uniform(0, rate_limit_jitter) if rate_limit_jitter > 0 else 0
+            time.sleep(rate_limit_delay + jitter)
+
+        return (page_id, True, None)
+    except Exception as e:
+        logger.error(f"Failed to export page {page_id}: {e}")
+        return (page_id, False, str(e))
+
+
 def export_pages(page_ids: list[int]) -> None:
     """Export a list of Confluence pages to Markdown.
 
     Args:
         page_ids: List of pages to export.
-        output_path: The output path.
     """
     # Reset category generator for fresh export
     global _category_generator  # noqa: PLW0603
     _category_generator = CategoryFileGenerator()
 
+    # Check if performance config exists (backward compatibility)
+    perf_config = getattr(settings, "performance", None)
+
+    # Fallback to sequential if parallel disabled or not configured
+    if perf_config is None or not perf_config.enable_parallel_export:
+        _export_pages_sequential(page_ids)
+        return
+
+    max_workers = perf_config.max_workers
+    rate_limit_delay = perf_config.rate_limit_delay
+    rate_limit_jitter = getattr(perf_config, "rate_limit_jitter", 0.25)
+
+    failed_pages: list[tuple[int, str]] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_page = {
+            executor.submit(
+                _export_page_worker, page_id, rate_limit_delay, rate_limit_jitter
+            ): page_id
+            for page_id in page_ids
+        }
+
+        with tqdm(total=len(page_ids), smoothing=0.05, desc="Exporting pages") as pbar:
+            for future in as_completed(future_to_page):
+                page_id = future_to_page[future]
+                try:
+                    result_page_id, success, error = future.result()
+                    if not success:
+                        failed_pages.append((result_page_id, error or "Unknown error"))
+                except Exception as e:
+                    failed_pages.append((page_id, str(e)))
+                    logger.error(f"Exception in export worker for page {page_id}: {e}")
+                finally:
+                    pbar.update(1)
+
+    # Report failed pages
+    if failed_pages:
+        logger.warning(f"Failed to export {len(failed_pages)} pages:")
+        for pid, error in failed_pages[:10]:
+            logger.warning(f"  - Page {pid}: {error}")
+        if len(failed_pages) > 10:
+            logger.warning(f"  ... and {len(failed_pages) - 10} more")
+
+    # Generate category files at the end
+    if settings.docusaurus.enabled:
+        get_category_generator().generate_category_files()
+
+
+def _export_pages_sequential(page_ids: list[int]) -> None:
+    """Original sequential export implementation (fallback)."""
     for page_id in (pbar := tqdm(page_ids, smoothing=0.05)):
         pbar.set_postfix_str(f"Exporting page {page_id}")
         export_page(page_id)
 
-    # Generate category files at the end
     if settings.docusaurus.enabled:
         get_category_generator().generate_category_files()
