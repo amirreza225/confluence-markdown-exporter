@@ -274,6 +274,14 @@ class ExportConfig(BaseModel):
             "which is not supported by standard markdown tables."
         ),
     )
+    include_toc: bool = Field(
+        default=True,
+        title="Include Table of Contents",
+        description=(
+            "Whether to include the table of contents (TOC) in exported pages. "
+            "When disabled, TOC macros will be removed from the output."
+        ),
+    )
 
 
 class DocusaurusConfig(BaseModel):

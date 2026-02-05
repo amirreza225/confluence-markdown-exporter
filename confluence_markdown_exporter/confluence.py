@@ -1376,6 +1376,10 @@ class Page(Document):
             return self.process_tag(jira_tables[0], parent_tags)
 
         def convert_toc(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
+            # Check if TOC should be included
+            if not settings.export.include_toc:
+                return ""
+
             tocs = self.page.body_export_soup.find_all(
                 "div", {"class": "toc-macro"}
             )
