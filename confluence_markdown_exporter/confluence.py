@@ -420,6 +420,8 @@ class Page(Document):
     editor2: str
     labels: list["Label"]
     attachments: list["Attachment"]
+    created_date: str = ""  # ISO 8601 timestamp from history.createdDate
+    modified_date: str = ""  # ISO 8601 timestamp from version.when
 
     @functools.cached_property
     def descendants(self) -> list[int]:
@@ -730,6 +732,10 @@ class Page(Document):
 
     @classmethod
     def from_json(cls, data: JsonResponse) -> "Page":
+        # Extract dates from version and history
+        version = data.get("version", {})
+        history = data.get("history", {})
+
         return cls(
             id=data.get("id", 0),
             title=data.get("title", ""),
@@ -743,6 +749,8 @@ class Page(Document):
             ],
             attachments=Attachment.from_page_id(data.get("id", 0)),
             ancestors=[ancestor.get("id") for ancestor in data.get("ancestors", [])][1:],
+            created_date=history.get("createdDate", ""),
+            modified_date=version.get("when", ""),
         )
 
     @classmethod
@@ -755,7 +763,7 @@ class Page(Document):
                     confluence.get_page_by_id(
                         page_id,
                         expand="body.view,body.export_view,body.editor2,metadata.labels,"
-                        "metadata.properties,ancestors",
+                        "metadata.properties,ancestors,version,history",
                     ),
                 )
             )
@@ -1051,12 +1059,15 @@ class Page(Document):
         def front_matter(self) -> str:
             indent = self.options["front_matter_indent"]
 
-            # Set basic properties
-            self.set_page_properties(tags=self.labels)
+            # Set basic properties (skip for Wiki.js which has its own format)
+            if not settings.export.wiki_js_mode:
+                self.set_page_properties(tags=self.labels)
 
-            # Add Docusaurus-specific frontmatter if enabled
+            # Add platform-specific frontmatter
             if settings.docusaurus.enabled:
                 self._add_docusaurus_frontmatter()
+            elif settings.export.wiki_js_mode:
+                self._add_wikijs_frontmatter()
 
             if not self.page_properties:
                 return ""
@@ -1136,6 +1147,31 @@ class Page(Document):
                 if tag:
                     tags.append(tag)
             return tags
+
+        def _add_wikijs_frontmatter(self) -> None:
+            """Add Wiki.js-specific frontmatter fields."""
+            from datetime import datetime
+            from datetime import timezone
+
+            self.set_page_properties(title=self.page.title)
+
+            # Extract description from first paragraph
+            description = self._extract_description(self.page.body)
+            self.set_page_properties(description=description or "")
+
+            self.set_page_properties(published=True)
+            self.set_page_properties(editor="markdown")
+
+            # Add dates (use current time as fallback)
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+            self.set_page_properties(date=self.page.modified_date or now_iso)
+            self.set_page_properties(dateCreated=self.page.created_date or now_iso)
+
+            # Convert labels to tags (without # prefix)
+            if self.page.labels:
+                tags = [label.name for label in self.page.labels]
+                self.set_page_properties(tags=tags)
 
         @property
         def breadcrumbs(self) -> str:
