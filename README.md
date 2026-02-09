@@ -51,6 +51,15 @@ Install python package via pip.
 pip install confluence-markdown-exporter
 ```
 
+#### Installing from Source
+
+To install a modified or development version from a local clone:
+
+```sh
+cd confluence-markdown-exporter
+pip install -e . --force-reinstall --no-deps
+```
+
 ### 2. Exporting
 
 Run the exporter with the desired Confluence page ID or space key. Execute the console application by typing `confluence-markdown-exporter` and one of the commands `pages`, `pages-with-descendants`, `spaces`, `all-spaces` or `config`. If a command is unclear, you can always add `--help` to get additional information.
@@ -149,6 +158,9 @@ This will open a menu where you can:
 | export.filename_encoding              | Character mapping for filename encoding.                                                                              | Default mappings for forbidden characters.                          |
 | export.filename_length                | Maximum length of filenames.                                                                                          | 255                                                                 |
 | export.include_document_title         | Whether to include the document title in the exported markdown file.                                                  | True                                                                |
+| export.wiki_js_mode                   | Enable Wiki.js compatibility mode. Pages with children become `folder/home.md`.                                       | False                                                               |
+| export.tables_as_html                 | Export tables as HTML instead of markdown (supports complex content in cells).                                        | False                                                               |
+| export.include_toc                    | Whether to include the table of contents (TOC) in exported pages.                                                     | True                                                                |
 | connection_config.backoff_and_retry   | Enable automatic retry with exponential backoff                                                                       | True                                                                |
 | connection_config.backoff_factor      | Multiplier for exponential backoff                                                                                    | 2                                                                   |
 | connection_config.max_backoff_seconds | Maximum seconds to wait between retries                                                                               | 60                                                                  |
@@ -264,6 +276,57 @@ After exporting, integrate with your Docusaurus site:
    cd docusaurus-site
    npm run build
    ```
+
+#### Wiki.js
+
+The exporter includes support for [Wiki.js](https://js.wiki/), a modern wiki engine. When Wiki.js mode is enabled, the exporter will:
+
+- Rename parent pages with children to `home.md` inside their folder (e.g., `Parent.md` becomes `Parent/home.md`)
+- Generate Wiki.js-compatible frontmatter (title, description, published, editor, dateCreated, dateModified, tags)
+- Use relative paths with `./` prefix for internal links
+- Handle `/display/` style Confluence links
+
+**Configuration**:
+
+To enable Wiki.js mode, set the following configuration:
+
+```json
+{
+  "export": {
+    "wiki_js_mode": true
+  }
+}
+```
+
+**Output Structure**:
+
+```sh
+output/
+└── my-space/
+    ├── home.md
+    ├── guides/
+    │   ├── home.md
+    │   ├── getting-started.md
+    │   └── advanced-topics.md
+    └── attachments/
+        └── diagram.png
+```
+
+**Frontmatter Example**:
+
+```yaml
+---
+title: Getting Started Guide
+description: Learn how to get started with our platform
+published: true
+editor: markdown
+dateCreated: 2024-01-15T10:30:00.000Z
+dateModified: 2024-06-20T14:45:00.000Z
+tags:
+  - tutorial
+  - beginner
+---
+```
 
 #### Obsidian
 
