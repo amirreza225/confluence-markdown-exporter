@@ -64,6 +64,8 @@ _SLUG_WHITESPACE = re.compile(r"\s+")
 _WIKI_PAGES_PATTERN = re.compile(r"/wiki/.+?/pages/(\d+)")
 _VIEWPAGE_PATTERN = re.compile(r"[/]pages/viewpage\.action\?pageId=(\d+)")
 _ATTACHMENT_URL_PATTERN = re.compile(r"/download/(?:attachments|thumbnails)/(\d+)/([^?]+)")
+_DISPLAY_PAGE_PATTERN = re.compile(r"/display/([^/~][^/]*)/([^/?#]+)")
+_DISPLAY_USER_PATTERN = re.compile(r"/display/~([^/?#]+)")
 _YAML_INDENT_PATTERN = re.compile(r"^( *)(- )", re.MULTILINE)
 
 # Increase recursion limit to handle deeply nested Confluence page structures
@@ -479,8 +481,8 @@ class Page(Document):
         filepath_template = Template(settings.export.page_path.replace("{", "${"))
         path = Path(filepath_template.safe_substitute(self._template_vars))
 
-        # Wiki.js mode: pages with children or attachments become folder/home.md
-        if settings.export.wiki_js_mode and (self.descendants or self.attachments):
+        # Wiki.js mode: all pages become folder/home.md
+        if settings.export.wiki_js_mode:
             # Transform "path/to/page.md" → "path/to/page/home.md"
             path = path.parent / path.stem / "home.md"
 
@@ -506,8 +508,8 @@ class Page(Document):
         filename = f"{slug}.md"
         final_path = path / filename
 
-        # Wiki.js mode: pages with children or attachments become folder/home.md
-        if settings.export.wiki_js_mode and (self.descendants or self.attachments):
+        # Wiki.js mode: all pages become folder/home.md
+        if settings.export.wiki_js_mode:
             # Transform "docs/space/page.md" → "docs/space/page/home.md"
             final_path = final_path.parent / final_path.stem / "home.md"
 
@@ -1610,7 +1612,41 @@ class Page(Document):
             if match := _VIEWPAGE_PATTERN.search(str(el.get("href", ""))):
                 page_id = match.group(1)
                 return self.convert_page_link(int(page_id))
-            if str(el.get("href", "")).startswith("#"):
+            # Handle /display/~username user profile links - convert to plain text
+            href = str(el.get("href", ""))
+            if match := _DISPLAY_USER_PATTERN.search(href):
+                # User profile links have no valid target in static export
+                return text
+            # Handle /display/SPACE/Page+Title pattern
+            if match := _DISPLAY_PAGE_PATTERN.search(href):
+                space_key = urllib.parse.unquote_plus(match.group(1))
+                page_title = urllib.parse.unquote_plus(match.group(2))
+                anchor = ""
+                # Extract anchor if present
+                if "#" in href:
+                    anchor_text = href.split("#")[-1]
+                    anchor = "#" + sanitize_key(anchor_text, "-")
+                try:
+                    page_data = cast(
+                        "JsonResponse",
+                        confluence.get_page_by_title(
+                            space=space_key, title=page_title, expand="version"
+                        ),
+                    )
+                    page_id = page_data.get("id")
+                    if page_id:
+                        link = self.convert_page_link(int(page_id))
+                        if anchor:
+                            # Append anchor: [Title](/path) -> [Title](/path#anchor)
+                            link = link.rstrip(")") + anchor + ")"
+                        return link
+                except Exception:
+                    logger.warning(
+                        f"Could not resolve /display/{space_key}/{page_title} "
+                        f"on page '{self.page.title}' (ID: {self.page.id})"
+                    )
+                    # Fall through to default behavior
+            if href.startswith("#"):
                 # Handle heading links
                 return f"[{text}](#{sanitize_key(text, '-')})"
 
@@ -2037,6 +2073,15 @@ class Page(Document):
 
         def _get_path_for_href(self, path: Path, style: Literal["absolute", "relative"]) -> str:
             """Get the path to use in href attributes based on settings."""
+            # Wiki.js mode: relative paths with .md extension (e.g., ./folder/home.md)
+            if settings.export.wiki_js_mode:
+                # Use relative path from current page to target page
+                result = os.path.relpath(path, self.page.export_path.parent)
+                # Ensure ./ prefix for same-directory or child paths
+                if not result.startswith(".."):
+                    result = "./" + result
+                return result
+
             # In Docusaurus mode, use absolute paths for static assets
             if settings.docusaurus.enabled:
                 path_str = str(path)
